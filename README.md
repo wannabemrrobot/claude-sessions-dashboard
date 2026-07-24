@@ -71,7 +71,7 @@ Claude Code stores each session as a `.jsonl` file under `~/.claude/projects/…
 
 ```bash
 # grab the script and make it executable
-curl -fsSL https://raw.githubusercontent.com/wannabemrrobot/claude-sessions/main/claude-sessions -o claude-sessions
+curl -fsSL https://raw.githubusercontent.com/wannabemrrobot/claude-sessions-dashboard/main/claude-sessions -o claude-sessions
 chmod +x claude-sessions
 
 # put it on your PATH
@@ -81,8 +81,8 @@ mv claude-sessions /usr/local/bin/      # or ~/bin, ~/.local/bin, …
 …or clone:
 
 ```bash
-git clone https://github.com/wannabemrrobot/claude-sessions.git
-cd claude-sessions && chmod +x claude-sessions
+git clone https://github.com/wannabemrrobot/claude-sessions-dashboard.git
+cd claude-sessions-dashboard && chmod +x claude-sessions
 ./claude-sessions
 ```
 
