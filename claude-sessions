@@ -1,0 +1,2218 @@
+#!/usr/bin/env python3
+"""
+claude-sessions — Browse, resume & manage every Claude Code session on this machine.
+
+Scans ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl (the resumable "main" sessions,
+not sidechain/subagent internals), extracts metadata, and (by default) serves a live
+local dashboard in your browser. Because it's served over http://127.0.0.1, the in-page
+Refresh, Rename and Delete are genuine one-click actions — no copy-a-command dance.
+
+Each session shows: title (your /rename name, else the AI title, else first prompt),
+project directory + git branch, last-activity date (relative + absolute), how many days
+old, session duration, active working time, and its full prompt history.
+
+Click any card (or its Resume button) to copy the exact command to resume it, e.g.
+  cd /path/to/project && claude --resume "my-name"
+which fixes the "no session named X" problem when resuming from another directory.
+
+Usage:
+    claude-sessions                 # serve the live dashboard and open it (default)
+    claude-sessions --port 7842     # serve on a preferred localhost port
+    claude-sessions --all           # also include SDK/agent-spawned sessions
+    claude-sessions --no-open       # serve, but don't open the browser
+    claude-sessions --static        # write a portable, self-contained static HTML file
+    claude-sessions --static --out ~/Desktop/sessions.html
+    claude-sessions --json          # dump raw session metadata as JSON
+    claude-sessions --rename ID_OR_NAME "New name"
+    claude-sessions --delete ID_OR_NAME [ID_OR_NAME ...]
+
+Stdlib only. The server binds 127.0.0.1 (loopback) and never talks to the network.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import glob
+import html
+import json
+import os
+import pathlib
+import re
+import shlex
+import sys
+import webbrowser
+from collections import defaultdict
+from datetime import datetime, timezone
+
+DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
+
+# Per-prompt character cap when embedding full prompt history (keeps the HTML bounded
+# even when a session contains a huge pasted blob). Oversized prompts get a marker.
+PROMPT_CAP = 6000
+
+# Pasted images are base64-inline in the JSONL and can total tens of MB, so we can't
+# embed them in the HTML. They are extracted to this sidecar folder (next to the output
+# HTML) and referenced by relative path, lazily loaded by the browser.
+ASSETS_DIRNAME = "claude-sessions-assets"
+_EXT_BY_MEDIA = {
+    "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+    "image/gif": "gif", "image/webp": "webp", "image/svg+xml": "svg",
+    "image/bmp": "bmp",
+}
+
+
+def parse_ts(ts):
+    """Parse an ISO-8601 timestamp to an aware datetime (assume UTC if naive), or None."""
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:  # some rows omit the trailing Z / offset -> treat as UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def extract_text(message):
+    """Pull plain user text out of a message value that may be a str or block list."""
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            return "\n".join(p for p in parts if p)
+    return ""
+
+
+# Claude Code logs each pasted image as TWO user rows:
+#   1. the real message: "[Image #N] <your text>" + the inline base64 image (renders fine)
+#   2. a companion bookkeeping row: "[Image: source: /tmp/.../N.png]" pointing at a
+#      transient cache file that gets cleaned up. This companion carries NO image data and
+#      duplicates the real row, so we strip it silently — the image already renders inline.
+# Separately, some older sessions logged ONLY "[Image: original WxH, displayed at ...]" with
+# no inline data anywhere: those images are genuinely gone, so we mark them "not stored".
+_IMG_SRC_RE = re.compile(r"\[Image:\s*source:\s*[^\]]+\]")
+_IMG_DIM_RE = re.compile(r"\[Image:\s*(original[^\]]*)\]")
+
+
+def process_image_annotations(text):
+    """Strip [Image: ...] text annotations, returning (clean_text, notes).
+
+    'source:' companion refs are removed silently (the real image is inline in a sibling
+    row). 'original WxH' annotations become notes -> 'image not stored' placeholders.
+    """
+    notes = []
+
+    def repl_dim(m):
+        mm = re.search(r"original\s+(\d+)x(\d+)", m.group(1))
+        notes.append(f"{mm.group(1)}×{mm.group(2)}" if mm else "pasted image")
+        return ""
+
+    cleaned = _IMG_SRC_RE.sub("", text)      # drop companion bookkeeping rows
+    cleaned = _IMG_DIM_RE.sub(repl_dim, cleaned)
+    return cleaned.strip(), notes
+
+
+def extract_images(message):
+    """Return [{media_type, data(base64)}] for base64 image blocks in a user message."""
+    out = []
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image":
+                    src = block.get("source")
+                    if isinstance(src, dict) and src.get("type") == "base64" and src.get("data"):
+                        out.append({
+                            "media_type": src.get("media_type", "image/png"),
+                            "data": src["data"],
+                        })
+    return out
+
+
+def looks_like_real_prompt(text):
+    """True for genuine human prompts; skips slash-command wrappers & injected reminders.
+
+    Tool-result rows carry no text blocks, so extract_text() already returns "" for them
+    and they fail the empty check below. We intentionally do NOT reject generic "<...>"
+    text, so legitimate markup prompts (e.g. "<svg .../>") are kept.
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+    skip_prefixes = (
+        "<local-command",
+        "<command-name>",
+        "<command-message>",
+        "<system-reminder>",
+        "<task-notification>",   # harness-injected background-task events, not typed prompts
+        "Caveat:",
+        "[Request interrupted",
+    )
+    return not t.startswith(skip_prefixes)
+
+
+def clean_prompt(text, limit=280):
+    """Strip common wrappers/slash-command noise and clamp length."""
+    if not text:
+        return ""
+    t = text.strip()
+    if t.startswith("<command-name>"):
+        idx = t.rfind(">")
+        t = t[idx + 1 :].strip() if idx != -1 else t
+    t = t.replace("\r", " ")
+    if len(t) > limit:
+        t = t[:limit].rstrip() + "…"
+    return t
+
+
+def home_abbrev(path):
+    """Display form of a path with the home dir collapsed to '~' (also hides the username)."""
+    if not path:
+        return path
+    home = os.path.expanduser("~")
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def scan_session(path):
+    """Single-pass parse of one session .jsonl into a metadata dict (or None if unusable)."""
+    session_id = os.path.splitext(os.path.basename(path))[0]
+    cwd = git_branch = version = entrypoint = None
+    custom_title = ai_title = last_prompt = first_prompt = None
+    first_ts = last_ts = None
+    active_ms = 0
+    turn_count = user_msgs = 0
+    prompt_list = []
+    model_counts = {}
+    tok_in = tok_out = tok_cc = tok_cr = web_search = web_fetch = 0
+
+    try:
+        fh = open(path, "r", errors="replace")
+    except OSError:
+        return None
+
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(d, dict):  # a bare JSON scalar on a line -> skip safely
+                continue
+            t = d.get("type")
+
+            if cwd is None and d.get("cwd"):
+                cwd = d["cwd"]
+            if git_branch is None and d.get("gitBranch"):
+                git_branch = d["gitBranch"]
+            if version is None and d.get("version"):
+                version = d["version"]
+            if entrypoint is None and d.get("entrypoint"):
+                entrypoint = d["entrypoint"]
+
+            ts = parse_ts(d.get("timestamp"))
+            if ts is not None:
+                if first_ts is None or ts < first_ts:
+                    first_ts = ts
+                if last_ts is None or ts > last_ts:
+                    last_ts = ts
+
+            if t == "custom-title":
+                custom_title = d.get("customTitle") or custom_title
+            elif t == "ai-title":
+                ai_title = d.get("aiTitle") or ai_title
+            elif t == "last-prompt":
+                last_prompt = d.get("lastPrompt") or last_prompt
+            elif t == "system":
+                if isinstance(d.get("durationMs"), (int, float)):
+                    active_ms += d["durationMs"]
+                if d.get("subtype") == "turn_duration":
+                    turn_count += 1
+            elif t == "assistant":
+                amsg = d.get("message")
+                if isinstance(amsg, dict):
+                    mdl = amsg.get("model")
+                    if mdl and mdl != "<synthetic>":
+                        model_counts[mdl] = model_counts.get(mdl, 0) + 1
+                    u = amsg.get("usage")
+                    if isinstance(u, dict):
+                        tok_in += u.get("input_tokens") or 0
+                        tok_out += u.get("output_tokens") or 0
+                        tok_cc += u.get("cache_creation_input_tokens") or 0
+                        tok_cr += u.get("cache_read_input_tokens") or 0
+                        stu = u.get("server_tool_use")
+                        if isinstance(stu, dict):
+                            web_search += stu.get("web_search_requests") or 0
+                            web_fetch += stu.get("web_fetch_requests") or 0
+            elif t == "user":
+                user_msgs += 1
+                msg = d.get("message")
+                images = extract_images(msg)          # inline base64 blocks (the real images)
+                body, notes = process_image_annotations(extract_text(msg).strip())
+                # A real prompt has typed text, an inline image, or a genuine "not stored"
+                # marker. Pure companion-reference rows collapse to empty here and are skipped.
+                if looks_like_real_prompt(body) or images or notes:
+                    if len(body) > PROMPT_CAP:
+                        body = body[:PROMPT_CAP] + "\n\n… [truncated {:,} more characters]".format(
+                            len(body) - PROMPT_CAP
+                        )
+                    entry = {"t": ts.isoformat() if ts else "", "text": body}
+                    if images:
+                        entry["images"] = images
+                    if notes:
+                        entry["imageRefs"] = [{"note": n} for n in notes]
+                    prompt_list.append(entry)
+                    if first_prompt is None and body:
+                        first_prompt = body
+
+    if first_ts is None and last_ts is None and not (custom_title or ai_title or last_prompt or first_prompt):
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
+            first_ts = last_ts = mtime
+        except OSError:
+            return None
+
+    if not cwd:  # lossy fallback only (encoding maps '/', '_', '-' all to '-')
+        enc = os.path.basename(os.path.dirname(path))
+        cwd = "/" + enc.lstrip("-").replace("-", "/")
+
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+
+    resume_name = custom_title or session_id
+    resume_cmd = "cd {} && claude --resume {}".format(shlex.quote(cwd), shlex.quote(resume_name))
+
+    span_ms = 0
+    if first_ts and last_ts:
+        span_ms = int((last_ts - first_ts).total_seconds() * 1000)
+
+    return {
+        "id": session_id,
+        "cwd": cwd,
+        "cwdShort": home_abbrev(cwd),
+        "project": os.path.basename(cwd.rstrip("/")) or cwd,
+        "gitBranch": git_branch or "",
+        "version": version or "",
+        "entrypoint": entrypoint or "",
+        "customTitle": custom_title or "",
+        "aiTitle": ai_title or "",
+        "firstPrompt": clean_prompt(first_prompt or ""),
+        "promptList": prompt_list,
+        "firstTs": first_ts.isoformat() if first_ts else "",
+        "lastTs": last_ts.isoformat() if last_ts else "",
+        "spanMs": span_ms,
+        "activeMs": int(active_ms),
+        "prompts": len(prompt_list),
+        "userMsgs": user_msgs,
+        "models": model_counts,
+        "tokIn": tok_in, "tokOut": tok_out, "tokCacheCreate": tok_cc, "tokCacheRead": tok_cr,
+        "webSearches": web_search, "webFetches": web_fetch,
+        "sizeBytes": size,
+        "hasName": bool(custom_title),
+        "ambiguous": False,
+        "resumeName": resume_name,
+        "resumeCmd": resume_cmd,
+        "filePath": path,
+    }
+
+
+# Entrypoints for sessions a user actually started interactively. Everything else
+# (notably "sdk-cli") is spawned programmatically via the Agent SDK — e.g. batch tools
+# that create one throwaway session per item — and is hidden by default.
+INTERACTIVE_ENTRYPOINTS = {"cli", "claude-desktop", "vscode", "jetbrains", "web", ""}
+
+
+def collect(root, include_all=False):
+    """Collect metadata for resumable (depth-1) sessions under root.
+
+    Returns (sessions, hidden) where `hidden` is the number of programmatic
+    (e.g. sdk-cli) sessions filtered out unless include_all is True.
+    """
+    scanned = []
+    for path in glob.glob(os.path.join(root, "*", "*.jsonl")):
+        info = scan_session(path)
+        if info is not None:
+            scanned.append(info)
+
+    if include_all:
+        sessions, hidden = scanned, 0
+    else:
+        sessions = [s for s in scanned if s["entrypoint"] in INTERACTIVE_ENTRYPOINTS]
+        hidden = len(scanned) - len(sessions)
+
+    # Disambiguate: multiple sessions can share the same custom name in one cwd, which
+    # makes `claude --resume "<name>"` ambiguous. For those, resume by unique session id.
+    groups = defaultdict(list)
+    for s in sessions:
+        if s["customTitle"]:
+            groups[(s["cwd"], s["customTitle"])].append(s)
+    for (cwd, _title), grp in groups.items():
+        if len(grp) > 1:
+            for s in grp:
+                s["ambiguous"] = True
+                s["resumeName"] = s["id"]
+                s["resumeCmd"] = "cd {} && claude --resume {}".format(
+                    shlex.quote(cwd), shlex.quote(s["id"])
+                )
+
+    sessions.sort(key=lambda s: s["lastTs"], reverse=True)
+    return sessions, hidden
+
+
+def delete_sessions(root, ids_or_names):
+    """Delete session .jsonl files by id, custom title, or resume name.
+
+    Returns (deleted_count, not_found).
+    """
+    sessions, _ = collect(root, include_all=True)
+    by_id = {s["id"]: s for s in sessions}
+    by_title = {s["customTitle"]: s for s in sessions if s["customTitle"]}
+    by_resume = {s["resumeName"]: s for s in sessions}
+
+    deleted = []
+    not_found = []
+    for token in ids_or_names:
+        token = token.strip()
+        s = by_id.get(token) or by_title.get(token) or by_resume.get(token)
+        if s is None:
+            not_found.append(token)
+            continue
+        path = s.get("filePath")
+        if not path or not os.path.isfile(path):
+            not_found.append(token)
+            continue
+        try:
+            os.remove(path)
+            deleted.append((s.get("customTitle") or s["id"], path))
+        except OSError as e:
+            not_found.append(f"{token}: {e}")
+    return deleted, not_found
+
+
+def rename_session(root, token, new_name):
+    """Rename a session by writing a custom-title row to its .jsonl file.
+
+    Looks up by id, current custom title, or resume name. Returns the session
+    info if successful, otherwise None.
+    """
+    sessions, _ = collect(root, include_all=True)
+    by_id = {s["id"]: s for s in sessions}
+    by_title = {s["customTitle"]: s for s in sessions if s["customTitle"]}
+    by_resume = {s["resumeName"]: s for s in sessions}
+
+    s = by_id.get(token) or by_title.get(token) or by_resume.get(token)
+    if s is None:
+        return None
+    path = s.get("filePath")
+    if not path or not os.path.isfile(path):
+        return None
+
+    entry = {
+        "type": "custom-title",
+        "customTitle": new_name,
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    try:
+        # Ensure the file ends in a newline before appending, so the custom-title row can't
+        # get glued onto the last line (which would corrupt both and lose the rename).
+        need_nl = False
+        try:
+            if os.path.getsize(path) > 0:
+                with open(path, "rb") as rf:
+                    rf.seek(-1, os.SEEK_END)
+                    need_nl = rf.read(1) != b"\n"
+        except OSError:
+            need_nl = False
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(("\n" if need_nl else "") + json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        return None
+    s["customTitle"] = new_name
+    s["hasName"] = True
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# HTML rendering
+# --------------------------------------------------------------------------- #
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code Sessions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;0,800;1,400&display=swap" rel="stylesheet">
+<script>
+  /* Set the theme before first paint (avoids a flash). Precedence: ?theme= → saved choice → dark (default). */
+  (function(){ var t='dark'; try{
+    var q=new URLSearchParams(location.search).get('theme');
+    var s=localStorage.getItem('claude-sessions.theme');
+    if(q==='light'||q==='dark') t=q; else if(s==='light'||s==='dark') t=s;
+  }catch(e){} document.documentElement.setAttribute('data-theme',t); })();
+</script>
+<style>
+  :root{
+    /* ---- Claude · light (warm paper + terracotta) ---- */
+    --bg:#F5F4EE; --grad-1:rgba(201,100,66,.07); --grad-2:rgba(184,134,58,.05);
+    --card:#FDFCF9; --card-h:#FFFFFF; --inset:#F0EEE6;
+    --text:#1F1E1D; --text-2:#52514C; --muted:#6E6C66; --muted-2:#8A877E;
+    --border:#E6E2D8; --border-2:#D6D1C4;
+    --accent:#C96442; --accent-ink:#A6432A; --accent-btn:#B24A2C; --accent-btn-h:#9E3F24; --on-accent:#FFFFFF;
+    --accent-soft:rgba(201,100,66,.10); --accent-soft-2:rgba(201,100,66,.16); --accent-line:rgba(201,100,66,.30);
+    --ok:#5E7A52; --ok-soft:rgba(94,122,82,.13);
+    --warn:#9A6B1E; --warn-soft:rgba(154,107,30,.13);
+    --danger:#B23A2C; --danger-ink:#9E3323; --danger-soft:rgba(178,58,44,.10);
+    --shadow-1:0 1px 2px rgba(43,38,30,.05), 0 2px 8px rgba(43,38,30,.05);
+    --shadow-2:0 14px 34px -14px rgba(43,38,30,.30), 0 2px 8px rgba(43,38,30,.06);
+    --shadow-pop:0 30px 70px -22px rgba(43,38,30,.42);
+    --radius:15px; --radius-sm:10px; --radius-lg:20px;
+    --ease:cubic-bezier(.16,1,.3,1);
+    --mono:"JetBrains Mono",ui-monospace,"SF Mono","SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
+    color-scheme:light;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme]){
+      --bg:#1E1D1B; --grad-1:rgba(224,136,95,.11); --grad-2:rgba(184,134,58,.06);
+      --card:#262624; --card-h:#2E2D2A; --inset:#191817;
+      --text:#F3F0E8; --text-2:#C7C3B8; --muted:#A8A49A; --muted-2:#8C887E;
+      --border:#35332E; --border-2:#413F38;
+      --accent:#E0885F; --accent-ink:#E89873; --accent-btn:#D97757; --accent-btn-h:#E28A66; --on-accent:#211C19;
+      --accent-soft:rgba(224,136,95,.13); --accent-soft-2:rgba(224,136,95,.20); --accent-line:rgba(224,136,95,.34);
+      --ok:#8FB37A; --ok-soft:rgba(143,179,122,.14);
+      --warn:#E0A54B; --warn-soft:rgba(224,165,75,.14);
+      --danger:#E5776A; --danger-ink:#EF8C80; --danger-soft:rgba(229,119,106,.14);
+      --shadow-1:0 1px 2px rgba(0,0,0,.28), 0 2px 8px rgba(0,0,0,.3);
+      --shadow-2:0 16px 38px -14px rgba(0,0,0,.62), 0 2px 8px rgba(0,0,0,.42);
+      --shadow-pop:0 34px 74px -22px rgba(0,0,0,.76);
+      color-scheme:dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#1E1D1B; --grad-1:rgba(224,136,95,.11); --grad-2:rgba(184,134,58,.06);
+    --card:#262624; --card-h:#2E2D2A; --inset:#191817;
+    --text:#F3F0E8; --text-2:#C7C3B8; --muted:#A8A49A; --muted-2:#8C887E;
+    --border:#35332E; --border-2:#413F38;
+    --accent:#E0885F; --accent-ink:#E89873; --accent-btn:#D97757; --accent-btn-h:#E28A66; --on-accent:#211C19;
+    --accent-soft:rgba(224,136,95,.13); --accent-soft-2:rgba(224,136,95,.20); --accent-line:rgba(224,136,95,.34);
+    --ok:#8FB37A; --ok-soft:rgba(143,179,122,.14);
+    --warn:#E0A54B; --warn-soft:rgba(224,165,75,.14);
+    --danger:#E5776A; --danger-ink:#EF8C80; --danger-soft:rgba(229,119,106,.14);
+    --shadow-1:0 1px 2px rgba(0,0,0,.28), 0 2px 8px rgba(0,0,0,.3);
+    --shadow-2:0 16px 38px -14px rgba(0,0,0,.62), 0 2px 8px rgba(0,0,0,.42);
+    --shadow-pop:0 34px 74px -22px rgba(0,0,0,.76);
+    color-scheme:dark;
+  }
+
+  *{ box-sizing:border-box; }
+  /* Authoritative: several toggled elements (#loading, #allWrap, #overlay) carry a class
+     that sets display, which would otherwise beat the UA [hidden] rule. */
+  [hidden]{ display:none !important; }
+  html{ scroll-behavior:smooth; }
+  body{
+    margin:0; background:var(--bg); color:var(--text); min-height:100vh;
+    font-family:var(--mono); font-size:13.5px; line-height:1.5;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    font-feature-settings:"liga" 0, "calt" 0;
+  }
+  /* Theme switch is instant: a page-wide transition on every element made it janky. */
+  body::before, body::after{ content:""; position:fixed; z-index:0; pointer-events:none; filter:blur(90px); }
+  body::before{ top:-180px; left:-140px; width:560px; height:560px;
+    background:radial-gradient(circle, var(--grad-1), transparent 70%); }
+  body::after{ bottom:-220px; right:-160px; width:600px; height:600px;
+    background:radial-gradient(circle, var(--grad-2), transparent 70%); }
+  ::selection{ background:var(--accent-soft-2); }
+
+  /* ---------- header ---------- */
+  header{
+    position:sticky; top:0; z-index:20;
+    background:color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter:blur(16px) saturate(150%); -webkit-backdrop-filter:blur(16px) saturate(150%);
+    border-bottom:1px solid var(--border); padding:15px 24px 13px;
+  }
+  .bar{ display:flex; align-items:center; gap:14px; margin-bottom:13px; }
+  .brand{ display:flex; align-items:center; gap:12px; min-width:0; }
+  .logo{
+    width:38px; height:38px; border-radius:11px; display:grid; place-items:center; flex-shrink:0;
+    background:linear-gradient(140deg, var(--accent), var(--accent-btn)); color:#fff;
+    box-shadow:0 6px 18px -4px var(--accent-line); }
+  .logo svg{ width:23px; height:23px; }
+  .brand h1{ margin:0; font-size:16px; font-weight:700; letter-spacing:-.02em; white-space:nowrap; }
+  .brand .sub{ color:var(--muted); font-size:11.5px; font-weight:400; white-space:nowrap; }
+  .spacer{ flex:1; }
+  .stats{ display:flex; gap:7px; flex-wrap:wrap; justify-content:flex-end; }
+  .stat{ background:var(--card); border:1px solid var(--border); border-radius:10px;
+    padding:5px 11px; display:flex; align-items:baseline; gap:6px; box-shadow:var(--shadow-1); }
+  .stat b{ font-size:14px; font-weight:700; color:var(--text); }
+  .stat span{ color:var(--muted); font-size:11px; }
+
+  .ctrl-btn{
+    display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-family:inherit;
+    background:var(--card); color:var(--text); border:1px solid var(--border-2);
+    border-radius:11px; padding:9px 14px; font-size:12.5px; font-weight:600;
+    box-shadow:var(--shadow-1); transition:background .15s var(--ease), border-color .15s var(--ease), transform .1s var(--ease), box-shadow .15s var(--ease);
+  }
+  .ctrl-btn:hover{ border-color:var(--accent-line); background:var(--card-h); }
+  .ctrl-btn:active{ transform:scale(.97); }
+  .ctrl-btn:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .ctrl-btn.primary{ background:linear-gradient(140deg, var(--accent), var(--accent-btn)); color:var(--on-accent);
+    border-color:transparent; box-shadow:0 6px 16px -6px var(--accent-line); }
+  .ctrl-btn.primary:hover{ filter:brightness(1.05); background:linear-gradient(140deg, var(--accent), var(--accent-btn)); }
+  .ctrl-btn.primary .ic svg{ color:var(--on-accent); }
+  .ctrl-btn.icon{ padding:9px; }
+  .ctrl-btn .ic{ display:inline-flex; }
+  .ctrl-btn[disabled]{ opacity:.6; cursor:default; }
+  #refreshBtn.spinning .ic{ animation:spin .8s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  .controls{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .search{ position:relative; flex:1; min-width:240px; }
+  .search svg{ position:absolute; left:13px; top:50%; transform:translateY(-50%); color:var(--muted-2); pointer-events:none; }
+  input[type=search]{
+    width:100%; background:var(--card); color:var(--text); border:1px solid var(--border-2);
+    border-radius:11px; padding:10px 12px 10px 40px; font-size:13px; font-family:inherit; outline:none;
+    transition:border-color .16s var(--ease), box-shadow .16s var(--ease), background .16s var(--ease); }
+  input[type=search]::placeholder{ color:var(--muted-2); }
+  input[type=search]:focus, select:focus{
+    border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); background:var(--card-h); }
+  select{
+    background:var(--card); color:var(--text); border:1px solid var(--border-2);
+    border-radius:11px; padding:10px 34px 10px 12px; font-size:12.5px; font-family:inherit; outline:none; cursor:pointer;
+    appearance:none; -webkit-appearance:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%238A877E' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat:no-repeat; background-position:right 11px center;
+    transition:border-color .16s var(--ease), box-shadow .16s var(--ease); }
+  .chip-toggle{
+    display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; user-select:none;
+    background:var(--card); border:1px solid var(--border-2); border-radius:11px; padding:9px 13px; cursor:pointer;
+    transition:border-color .15s var(--ease), color .15s var(--ease); }
+  .chip-toggle:hover{ border-color:var(--accent-line); color:var(--text-2); }
+  .chip-toggle input{ accent-color:var(--accent); width:15px; height:15px; cursor:pointer; }
+  .chip-toggle>label{ display:inline-flex; align-items:center; gap:8px; cursor:pointer; color:inherit; }
+  .info{ display:inline-flex; align-items:center; color:var(--muted-2); cursor:help; position:relative; border-radius:50%; }
+  .info:hover, .info:focus, .info:focus-visible{ color:var(--accent); outline:none; }
+  .info svg{ display:block; }
+  .tip{
+    position:absolute; top:calc(100% + 9px); right:-10px; z-index:70; width:260px; max-width:78vw;
+    padding:8px 10px; background:#FFFFFF; color:#33322F; border:1px solid #E4E0D6;
+    border-radius:9px; box-shadow:0 12px 30px -12px rgba(20,16,12,.4), 0 2px 8px rgba(20,16,12,.14);
+    font-size:10px; line-height:1.5; font-weight:500; text-align:left; white-space:normal;
+    opacity:0; transform:translateY(-5px); pointer-events:none;
+    transition:opacity .16s var(--ease), transform .16s var(--ease); }
+  .tip b{ color:#141312; font-weight:700; }
+  .tip code{ background:#F1EFE9; border:1px solid #E4E0D6; border-radius:5px; padding:1px 5px; color:#B0492A; }
+  .tip::before{ content:""; position:absolute; top:-5px; right:15px; width:9px; height:9px; background:#FFFFFF;
+    border-left:1px solid #E4E0D6; border-top:1px solid #E4E0D6; transform:rotate(45deg); }
+  .info:hover .tip, .info:focus .tip, .info:focus-within .tip{ opacity:1; transform:none; pointer-events:auto; }
+  .genline{ color:var(--muted-2); font-size:11px; margin-top:11px; display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+  .genline b{ color:var(--muted); font-weight:600; }
+
+  /* ---------- layout ---------- */
+  main{ position:relative; z-index:1; padding:22px 24px 80px; max-width:1640px; margin:0 auto; }
+  .grid{ display:grid; gap:16px; grid-template-columns:repeat(auto-fill, minmax(340px, 1fr)); }
+
+  /* ---------- card ---------- */
+  .card{
+    background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+    padding:15px 16px 14px; cursor:pointer; position:relative; overflow:hidden;
+    display:flex; flex-direction:column; gap:10px; box-shadow:var(--shadow-1);
+    transition:transform .18s var(--ease), border-color .18s var(--ease), box-shadow .18s var(--ease); }
+  .card:hover{ transform:translateY(-3px); border-color:var(--accent-line); box-shadow:var(--shadow-2); }
+  .card:active{ transform:translateY(-1px) scale(.996); }
+  .card:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .card.named::before{ content:""; position:absolute; left:0; top:0; bottom:0; width:3px;
+    background:linear-gradient(180deg, var(--accent), var(--accent-btn)); }
+  .card.enter{ animation:cardIn .42s var(--ease) both; animation-delay:calc(var(--i,0) * 28ms); }
+  @keyframes cardIn{ from{ opacity:0; transform:translateY(14px) scale(.985); } to{ opacity:1; transform:none; } }
+
+  .row1{ display:flex; align-items:flex-start; gap:9px; }
+  .title{ font-weight:700; font-size:14.5px; letter-spacing:-.01em; line-height:1.38; color:var(--text);
+    overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; word-break:break-word; }
+  .card.named .title{ color:var(--accent-ink); }   /* named sessions: title in the Claude accent */
+  .title-input{ font-family:inherit; font-weight:700; font-size:14.5px; width:100%; color:var(--text);
+    background:var(--inset); border:1px solid var(--accent); border-radius:8px; padding:5px 8px; outline:none;
+    box-shadow:0 0 0 3px var(--accent-soft); }
+  /* min-height keeps the running dot on the title's line whether or not a badge is present,
+     so the dot is aligned across every card */
+  .badges{ display:flex; gap:5px; margin-left:auto; flex-shrink:0; align-items:center; justify-content:flex-end; min-height:21px; }
+  .badge{ display:inline-flex; align-items:center; gap:4px; font-size:10px; font-weight:700; letter-spacing:.01em;
+    padding:2px 7px; border-radius:6px; white-space:nowrap; max-width:150px; overflow:hidden; text-overflow:ellipsis; }
+  .badge.named{ color:var(--accent-ink); background:var(--accent-soft); border:1px solid var(--accent-line); }
+  .badge.warn{ color:var(--warn); background:none; border:none; padding:0; cursor:help; }
+  .badge.warn svg{ width:14px; height:14px; }
+  .badge svg{ flex-shrink:0; }
+
+  .pathline{ display:flex; flex-direction:column; align-items:flex-start; gap:5px; color:var(--muted); font-size:11px; min-width:0; }
+  .pathline .p{ display:flex; align-items:center; gap:6px; max-width:100%; min-width:0; }
+  .pathline .ptxt{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pathline .br{ display:flex; align-items:center; gap:5px; max-width:100%; min-width:0; color:var(--ok); font-weight:700; }
+  .pathline .brtxt{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pathline .p svg{ flex-shrink:0; color:var(--muted-2); }
+  .pathline .br svg{ flex-shrink:0; color:var(--ok); }
+
+  .meta{ display:flex; flex-wrap:wrap; gap:6px; }
+  .chip{ display:inline-flex; align-items:center; gap:5px; background:var(--inset); border:1px solid var(--border);
+    border-radius:8px; padding:3px 8px; font-size:11px; color:var(--muted); white-space:nowrap; }
+  .chip svg{ color:var(--muted-2); }
+  .chip b{ color:var(--text); font-weight:600; }
+  .chip.fresh{ border-color:color-mix(in srgb, var(--ok) 40%, transparent); background:var(--ok-soft); }
+  .chip.fresh b, .chip.fresh svg{ color:var(--ok); }
+  .chip.old b{ color:var(--warn); }
+
+  /* secondary style — soft outline so the solid Resume button stays the clear primary */
+  .prompts-btn{
+    display:inline-flex; align-items:center; gap:7px; align-self:flex-start; cursor:pointer; font-family:inherit;
+    background:var(--accent-soft); border:1px solid var(--accent-line); color:var(--accent-ink);
+    border-radius:9px; padding:6px 11px; font-size:12px; font-weight:600;
+    transition:background .15s var(--ease), border-color .15s var(--ease), transform .1s var(--ease); }
+  .prompts-btn svg{ color:var(--accent-ink); }
+  .prompts-btn:hover{ background:var(--accent-soft-2); border-color:var(--accent); }
+  .prompts-btn:active{ transform:scale(.97); }
+  .prompts-btn:disabled{ opacity:.55; cursor:default; color:var(--muted-2); background:var(--inset); border-color:var(--border); }
+  .prompts-btn:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .prompts-btn .cnt{ color:var(--text); font-weight:700; }
+
+  /* two separate solid buttons (like Resume), with a gap between them */
+  .btnrow{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+
+  /* live "running" indicator */
+  @keyframes livepulse{ 0%{ box-shadow:0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); } 70%{ box-shadow:0 0 0 5px transparent; } 100%{ box-shadow:0 0 0 0 transparent; } }
+  /* bare pulsing dot in the card's top-right — the only "running" cue */
+  .runningdot{ width:10px; height:10px; border-radius:50%; background:var(--ok); align-self:center; flex-shrink:0; display:none; }
+  .card.live .runningdot{ display:inline-block; animation:livepulse 1.6s ease-out infinite; }
+  .stat.live{ align-items:center; background:var(--ok-soft); border-color:color-mix(in srgb, var(--ok) 45%, transparent); }
+  .stat.live b{ color:var(--ok); }
+  .stat.live .livedot{ width:7px; height:7px; border-radius:50%; background:var(--ok); flex-shrink:0; animation:livepulse 1.6s ease-out infinite; }
+
+  /* margin-top:auto pins the resume row + actions to the exact bottom of every card,
+     so the bottom bar is uniform regardless of how tall the content above is. */
+  .cmdrow{ display:flex; gap:8px; align-items:center; margin-top:auto; padding-top:2px; }
+  .cmd{ flex:1; min-width:0; text-align:left; font-family:inherit; font-size:10.5px; cursor:pointer;
+    background:var(--inset); border:1px solid var(--border); border-radius:9px; padding:7px 10px;
+    color:var(--text-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    transition:border-color .15s var(--ease), color .15s var(--ease); }
+  .cmd:hover{ border-color:var(--accent-line); color:var(--text); }
+  .cmd:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .resume{
+    display:inline-flex; align-items:center; gap:6px; flex-shrink:0; cursor:pointer; font-family:inherit;
+    background:linear-gradient(140deg, var(--accent), var(--accent-btn)); color:var(--on-accent);
+    border:none; border-radius:9px; padding:8px 13px; font-size:12px; font-weight:700;
+    box-shadow:0 6px 15px -7px var(--accent-line); transition:filter .15s var(--ease), transform .1s var(--ease); }
+  .resume:hover{ filter:brightness(1.06); }
+  .resume:active{ transform:scale(.96); }
+  .resume:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .resume svg{ color:var(--on-accent); }
+
+  .actions{ display:flex; align-items:center; gap:6px; margin-top:1px; min-height:30px; }
+  .act{
+    display:inline-flex; align-items:center; gap:6px; cursor:pointer; font-family:inherit;
+    background:transparent; color:var(--muted); border:1px solid transparent; border-radius:8px;
+    padding:5px 9px; font-size:11.5px; font-weight:600;
+    transition:background .13s var(--ease), color .13s var(--ease), border-color .13s var(--ease); }
+  .act:hover{ background:var(--inset); color:var(--text); border-color:var(--border); }
+  .act:disabled{ opacity:.4; cursor:default; }
+  .act:disabled:hover{ background:transparent; color:var(--muted); border-color:transparent; }
+  .act:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .act svg{ flex-shrink:0; }
+  .act.delete:hover, .act.danger{ color:var(--danger-ink); }
+  .act.danger:hover{ background:var(--danger-soft); border-color:color-mix(in srgb, var(--danger) 40%, transparent); }
+  .act.solid{ background:var(--danger); color:#fff; border-color:transparent; }
+  .act.solid:hover{ background:var(--danger); filter:brightness(1.06); color:#fff; }
+  .act-spacer{ flex:1; }
+  .confirm-txt{ color:var(--danger-ink); font-size:11.5px; font-weight:600; display:inline-flex; align-items:center; gap:6px; }
+  .confirm-txt svg{ color:var(--danger-ink); }
+
+  /* ---------- toast ---------- */
+  #toast{
+    position:fixed; bottom:26px; left:50%; z-index:90; transform:translateX(-50%) translateY(24px); opacity:0;
+    display:flex; align-items:center; gap:9px; pointer-events:none;
+    background:var(--card); border:1px solid var(--border-2); color:var(--text); font-weight:600; font-size:12.5px;
+    padding:11px 17px; border-radius:12px; box-shadow:var(--shadow-pop);
+    transition:transform .3s var(--ease), opacity .3s var(--ease); }
+  #toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
+  #toast .ic-ok svg{ color:var(--ok); } #toast .ic-warn svg{ color:var(--warn); }
+
+  /* themed hover tooltip (replaces native title=) — white card, grey/black text */
+  #tooltip{
+    position:fixed; z-index:95; max-width:340px; padding:4px 8px;
+    background:#FFFFFF; color:#33322F; border:1px solid #E4E0D6; border-radius:6px;
+    box-shadow:0 8px 22px -12px rgba(20,16,12,.36), 0 2px 5px rgba(20,16,12,.12);
+    font-size:10px; line-height:1.45; font-weight:500; white-space:normal; text-align:left;
+    word-break:break-word; overflow-wrap:anywhere;
+    opacity:0; transform:translateY(3px); pointer-events:none;
+    transition:opacity .12s var(--ease), transform .12s var(--ease); }
+  #tooltip.show{ opacity:1; transform:none; }
+
+  /* ---------- empty / loading ---------- */
+  .empty{ color:var(--muted); text-align:center; padding:90px 20px; font-size:14px; }
+  .empty svg{ color:var(--muted-2); margin-bottom:14px; }
+  .loading{ display:flex; flex-direction:column; align-items:center; gap:14px; padding:100px 20px; color:var(--muted); }
+  .spinner{ width:34px; height:34px; border-radius:50%; border:3px solid var(--border-2); border-top-color:var(--accent);
+    animation:spin .8s linear infinite; }
+
+  /* ---------- prompt modal ---------- */
+  .overlay{ position:fixed; inset:0; z-index:80; display:flex; align-items:center; justify-content:center; padding:24px;
+    background:color-mix(in srgb, var(--bg) 40%, rgba(15,12,8,.55)); backdrop-filter:blur(7px);
+    opacity:0; pointer-events:none; transition:opacity .2s var(--ease); }
+  .overlay.show{ opacity:1; pointer-events:auto; }
+  .modal{ width:min(800px,100%); max-height:85vh; display:flex; flex-direction:column;
+    background:var(--card); border:1px solid var(--border-2); border-radius:18px; overflow:hidden;
+    box-shadow:var(--shadow-pop); transform:translateY(14px) scale(.99); transition:transform .22s var(--ease); }
+  .overlay.show .modal{ transform:none; }
+  .modal-head{ display:flex; align-items:flex-start; gap:12px; padding:17px 20px 14px; border-bottom:1px solid var(--border);
+    position:sticky; top:0; background:var(--card); z-index:1; }
+  .modal-head .mt{ font-size:15px; font-weight:700; letter-spacing:-.01em; line-height:1.35; }
+  .modal-head .ms{ color:var(--muted); font-size:11.5px; margin-top:4px; word-break:break-all; }
+  .modal-tools{ margin-left:auto; display:flex; gap:6px; flex-shrink:0; }
+  .modal-tools button, .modal-close{ cursor:pointer; font-family:inherit; background:var(--inset); border:1px solid var(--border);
+    color:var(--muted); border-radius:8px; transition:background .15s var(--ease), color .15s var(--ease); }
+  .modal-tools button{ padding:6px 10px; font-size:11px; font-weight:600; }
+  .modal-tools button:hover, .modal-close:hover{ background:var(--card-h); color:var(--text); border-color:var(--border-2); }
+  .modal-close{ flex-shrink:0; width:32px; height:32px; display:grid; place-items:center; font-size:0; }
+  .modal-close:focus-visible, .modal-tools button:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .chip.model b{ color:var(--accent-ink); } .chip.model svg{ color:var(--accent); }
+  .modal-stats{ display:flex; flex-wrap:wrap; align-items:center; gap:6px 16px; padding:9px 20px; border-bottom:1px solid var(--border); font-size:11px; color:var(--muted); }
+  .modal-stats .mstat{ display:inline-flex; align-items:center; gap:6px; }
+  .modal-stats .mstat svg{ color:var(--muted-2); flex-shrink:0; }
+  .modal-stats b{ color:var(--text-2); font-weight:600; }
+  .modal-stats .cost, .modal-stats .cost b{ color:var(--accent-ink); cursor:help; }
+  .modal-search{ display:flex; align-items:center; gap:9px; padding:10px 20px; border-bottom:1px solid var(--border); }
+  .modal-search svg{ color:var(--muted-2); flex-shrink:0; }
+  .modal-search input{ flex:1; min-width:0; background:var(--inset); color:var(--text); border:1px solid var(--border);
+    border-radius:9px; padding:7px 11px; font-family:inherit; font-size:12.5px; outline:none;
+    transition:border-color .15s var(--ease), box-shadow .15s var(--ease); }
+  .modal-search input:focus{ border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .ms-count{ color:var(--muted); font-size:11px; white-space:nowrap; min-width:42px; text-align:right; }
+  .ms-nav{ cursor:pointer; background:var(--inset); border:1px solid var(--border); color:var(--muted); border-radius:7px;
+    width:28px; height:28px; display:grid; place-items:center; flex-shrink:0; transition:background .15s var(--ease), color .15s var(--ease); }
+  .ms-nav:hover{ background:var(--card-h); color:var(--text); }
+  .ms-nav:disabled{ opacity:.4; cursor:default; }
+  .ms-nav#convPrev svg{ transform:rotate(180deg); }
+  mark.hl{ background:color-mix(in srgb, var(--warn) 55%, transparent); color:var(--text); border-radius:3px; padding:0 1px; scroll-margin:80px; }
+  mark.hl.hl-current{ background:var(--accent); color:var(--on-accent); }
+  .modal-body{ overflow-y:auto; padding:16px 20px 20px; display:flex; flex-direction:column; gap:11px; }
+  .prompt{ border:1px solid var(--border); border-radius:12px; background:var(--inset); overflow:hidden; flex-shrink:0; }
+  .prompt-head{ display:flex; align-items:center; gap:9px; padding:8px 12px; cursor:pointer; user-select:none;
+    border-bottom:1px solid var(--border); transition:background .15s var(--ease); }
+  .prompt-head:hover{ background:var(--card-h); }
+  .prompt-chev{ color:var(--muted-2); display:inline-flex; transition:transform .18s var(--ease); }
+  .prompt-n{ font-weight:700; color:var(--accent-ink); font-size:11.5px; }
+  .prompt-t{ color:var(--muted-2); font-size:11px; white-space:nowrap; }
+  .prompt-preview{ color:var(--muted); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
+  .prompt-copy{ margin-left:auto; cursor:pointer; background:none; border:1px solid var(--border); color:var(--muted);
+    border-radius:7px; padding:3px 6px; display:inline-flex; flex-shrink:0; transition:background .15s var(--ease); }
+  .prompt-copy:hover{ background:var(--card-h); color:var(--text); }
+  .prompt.collapsed .prompt-head{ border-bottom:none; }
+  .prompt.collapsed .prompt-chev{ transform:rotate(-90deg); }
+  .prompt.collapsed .prompt-text, .prompt.collapsed .prompt-imgs, .prompt.collapsed .prompt-refs{ display:none; }
+  .prompt:not(.collapsed) .prompt-preview{ display:none; }
+  .prompt-text{ padding:11px 13px; font-size:12.5px; line-height:1.6; color:var(--text); white-space:pre-wrap; word-break:break-word; background:var(--card); }
+  .prompt-refs{ display:flex; flex-wrap:wrap; gap:8px; padding:12px 13px; background:var(--card); }
+  .prompt-ref{ display:inline-flex; align-items:center; gap:7px; color:var(--muted); background:var(--warn-soft);
+    border:1px dashed color-mix(in srgb, var(--warn) 45%, transparent); border-radius:9px; padding:8px 11px; font-size:11.5px; }
+  .prompt-ref svg{ color:var(--warn); flex-shrink:0; } .prompt-ref .dim{ color:var(--muted-2); font-size:10.5px; }
+  .prompt-imgs{ display:flex; flex-wrap:wrap; gap:10px; padding:12px 13px; background:var(--card); }
+  .prompt-imgs a{ display:block; border:1px solid var(--border); border-radius:9px; overflow:hidden; line-height:0;
+    transition:border-color .15s var(--ease), transform .1s var(--ease); }
+  .prompt-imgs a:hover{ border-color:var(--accent); transform:scale(1.01); }
+  .prompt-imgs img{ display:block; max-width:100%; max-height:380px; width:auto; height:auto; background:var(--inset); }
+  .prompt-imgs .imeta{ display:block; font-size:10px; color:var(--muted-2); padding:4px 8px; border-top:1px solid var(--border); }
+  .modal-empty{ color:var(--muted); text-align:center; padding:40px; }
+
+  /* conversation (transcript) turns */
+  .convo-wrap{ display:flex; flex-direction:column; gap:10px; }
+  .turn{ border:1px solid var(--border); border-radius:12px; overflow:hidden; background:var(--inset); }
+  .turn-head{ display:flex; align-items:center; gap:8px; padding:7px 12px; }
+  .turn .who{ font-weight:700; font-size:11.5px; display:inline-flex; align-items:center; gap:6px; }
+  .turn .who svg{ flex-shrink:0; }
+  .turn .tt{ color:var(--muted-2); font-size:10.5px; margin-left:auto; white-space:nowrap; }
+  .turn.user{ border-color:var(--accent-line); }
+  .turn.user .who{ color:var(--accent-ink); }
+  .turn.assistant{ background:var(--card); }
+  .turn.assistant .who{ color:var(--text); }
+  .turn-body{ padding:11px 13px; display:flex; flex-direction:column; gap:9px; }
+  .turn-body .ptext{ font-size:12.5px; line-height:1.62; white-space:pre-wrap; word-break:break-word; color:var(--text); }
+  /* rendered markdown (assistant turns) */
+  .turn-body .md-p{ font-size:12.5px; line-height:1.62; white-space:pre-wrap; word-break:break-word; color:var(--text); }
+  .turn-body .md-h{ font-weight:700; color:var(--text); line-height:1.35; margin-top:2px; }
+  .turn-body .md-h1{ font-size:15px; } .turn-body .md-h2{ font-size:14px; } .turn-body .md-h3{ font-size:13px; }
+  .turn-body .md-h4, .turn-body .md-h5, .turn-body .md-h6{ font-size:12.5px; }
+  .turn-body .md-ul, .turn-body .md-ol{ margin:0; padding-left:19px; display:flex; flex-direction:column; gap:3px; font-size:12.5px; line-height:1.55; color:var(--text); }
+  .turn-body .md-bq{ border-left:3px solid var(--accent-line); padding:1px 0 1px 11px; color:var(--muted); font-size:12.5px; line-height:1.55; }
+  .turn-body .md-hr{ height:1px; background:var(--border); }
+  .turn-body code{ background:var(--inset); border:1px solid var(--border); border-radius:5px; padding:1px 5px; font-size:11.5px; color:var(--accent-ink); word-break:break-word; }
+  .turn-body strong{ font-weight:700; color:var(--text); }
+  .turn-body em{ font-style:italic; }
+  .turn-body a{ color:var(--accent-ink); text-decoration:underline; text-underline-offset:2px; }
+  .turn .code{ margin:0; padding:10px 12px; background:var(--bg); border:1px solid var(--border); border-radius:8px;
+    font-size:11.5px; line-height:1.5; color:var(--text-2); overflow-x:auto; white-space:pre; }
+  .turn.tool{ background:transparent; }
+  .turn.tool .turn-head{ cursor:pointer; user-select:none; }
+  .turn.tool .turn-head:hover{ background:var(--inset); }
+  .turn.tool .who{ color:var(--muted); font-weight:600; }
+  .turn.tool.err .who{ color:var(--danger-ink); }
+  .turn.tool .code{ margin:0 12px 12px; }
+  .turn.tool.collapsed .code{ display:none; }
+  .turn.tool .turn-head::after{ content:""; width:7px; height:7px; margin-left:2px; border-right:2px solid var(--muted-2);
+    border-bottom:2px solid var(--muted-2); transform:rotate(45deg) translateY(-1px); transition:transform .15s var(--ease); }
+  .turn.tool.collapsed .turn-head::after{ transform:rotate(-45deg); }
+
+  @media (prefers-reduced-motion: reduce){
+    *{ transition:none !important; scroll-behavior:auto !important; animation:none !important; }
+    body::before, body::after{ display:none; }
+    .card.enter{ opacity:1; transform:none; }
+  }
+  @media (max-width:680px){
+    header{ padding:13px 15px; } main{ padding:16px 15px 60px; }
+    .grid{ grid-template-columns:1fr; } .bar{ flex-wrap:wrap; }
+    .brand .sub{ display:none; } .stats{ order:3; width:100%; justify-content:flex-start; }
+    .search{ min-width:100%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="brand">
+      <span class="logo">__ICON_LOGO__</span>
+      <div class="brand-txt">
+        <h1>Claude Code Sessions</h1>
+        <div class="sub">Browse &amp; resume every session on this machine</div>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="stats" id="stats"></div>
+    <button type="button" id="refreshBtn" class="ctrl-btn primary" data-tip="Reload sessions from disk">
+      <span class="ic" id="refreshIcon"></span><span class="lbl">Refresh</span>
+    </button>
+    <button type="button" id="themeToggle" class="ctrl-btn icon" aria-label="Toggle light / dark theme">
+      <span class="ic" id="themeIcon"></span>
+    </button>
+  </div>
+  <div class="controls">
+    <div class="search">
+      __ICON_SEARCH__
+      <input type="search" id="q" placeholder="Search name, prompt, project, branch…" autofocus>
+    </div>
+    <select id="proj" aria-label="Filter by project"></select>
+    <select id="sort" aria-label="Sort order">
+      <option value="recent">Last activity ↓</option>
+      <option value="oldest">Oldest first</option>
+      <option value="span">Longest duration</option>
+      <option value="prompts">Most prompts</option>
+      <option value="named">Named first</option>
+      <option value="project">Project A→Z</option>
+    </select>
+    <label class="chip-toggle"><input type="checkbox" id="onlynamed"> Named only</label>
+    <span class="chip-toggle info-host" id="allWrap" hidden>
+      <label><input type="checkbox" id="showall"> Include SDK/agent</label>
+      <span class="info" tabindex="0" role="button" aria-label="About SDK/agent sessions" aria-describedby="allInfoTip">
+        <span id="infoIcon"></span>
+        <span class="tip" id="allInfoTip" role="tooltip">Sessions spawned <b>programmatically</b> — mainly <code>entrypoint: "sdk-cli"</code> — created by the Agent SDK, batch tools, subagents, workflows and other automation. They often spin up one throwaway session per item, so they're mostly noise: you didn't start them, and resuming them by hand rarely makes sense. <b>Hidden by default.</b></span>
+      </span>
+    </span>
+  </div>
+  <div class="genline" id="genline"></div>
+</header>
+<main>
+  <div class="loading" id="loading"><div class="spinner"></div><div>Loading sessions…</div></div>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" hidden>__ICON_SEARCH_BIG__<div>No sessions match your filter.</div></div>
+</main>
+<div id="toast"></div>
+<div id="tooltip" role="tooltip" aria-hidden="true"></div>
+
+<div class="overlay" id="overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <div>
+        <div class="mt" id="modalTitle"></div>
+        <div class="ms" id="modalSub"></div>
+      </div>
+      <div class="modal-tools">
+        <button type="button" id="orderToggle" data-tip="Switch between oldest-first and newest-first">Oldest first</button>
+        <button type="button" id="expandAll">Expand all</button>
+        <button type="button" id="collapseAll">Collapse all</button>
+      </div>
+      <button class="modal-close" id="modalClose" aria-label="Close">__ICON_X__</button>
+    </div>
+    <div class="modal-search" id="modalSearch" hidden>
+      __ICON_SEARCH__
+      <input type="search" id="convSearch" placeholder="Search this conversation…" autocomplete="off">
+      <span class="ms-count" id="convCount"></span>
+      <button type="button" class="ms-nav" id="convPrev" aria-label="Previous match"></button>
+      <button type="button" class="ms-nav" id="convNext" aria-label="Next match"></button>
+    </div>
+    <div class="modal-stats" id="modalStats" hidden></div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script>
+__APP_JS__
+</script>
+</body>
+</html>
+"""
+
+# Icons injected into the static shell (outside the JS-rendered cards). A 12-ray sunburst
+# echoes Claude's mark; the rest are Lucide (MIT). The card icons live in the JS `IC` map.
+_SHELL_ICONS = {
+    "__ICON_LOGO__": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="12" y1="3" x2="12" y2="21"/><line x1="4.21" y1="7.5" x2="19.79" y2="16.5"/><line x1="7.5" y1="4.21" x2="16.5" y2="19.79"/><line x1="16.5" y1="4.21" x2="7.5" y2="19.79"/><line x1="19.79" y1="7.5" x2="4.21" y2="16.5"/></svg>',
+    "__ICON_SEARCH__": '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
+    "__ICON_SEARCH_BIG__": '<svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
+    "__ICON_X__": '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
+}
+
+
+def externalize_images(sessions, assets_dir):
+    """Write each prompt's inline base64 images to assets_dir/<sid>/pN-M.ext and rewrite
+    each image entry in-place to {src: <relative-url>, media_type}. Returns (count, bytes).
+
+    Files are written once and reused across runs (session data is immutable), so only the
+    first run pays the extraction cost.
+    """
+    n_imgs = n_bytes = 0
+    for s in sessions:
+        sid = s["id"]
+        for pi, p in enumerate(s.get("promptList", [])):
+            imgs = p.get("images")
+            if not imgs:
+                continue
+            rewritten = []
+            for ii, im in enumerate(imgs):
+                ext = _EXT_BY_MEDIA.get((im.get("media_type") or "").lower(), "png")
+                sdir = os.path.join(assets_dir, sid)
+                fname = "p{}-{}.{}".format(pi, ii, ext)
+                fpath = os.path.join(sdir, fname)
+                try:
+                    if os.path.exists(fpath):
+                        n_bytes += os.path.getsize(fpath)
+                    else:
+                        raw = base64.b64decode(im["data"])
+                        os.makedirs(sdir, exist_ok=True)
+                        with open(fpath, "wb") as fh:
+                            fh.write(raw)
+                        n_bytes += len(raw)
+                    n_imgs += 1
+                    rewritten.append({
+                        "src": "{}/{}/{}".format(ASSETS_DIRNAME, sid, fname),
+                        "media_type": im.get("media_type", ""),
+                    })
+                except (ValueError, OSError):
+                    continue  # corrupt base64 / unreadable path -> just drop that image
+            if rewritten:
+                p["images"] = rewritten
+            else:
+                p.pop("images", None)
+    return n_imgs, n_bytes
+
+
+def _strip_image_data(sessions):
+    """For --json: replace heavy base64 with a light descriptor so output stays readable."""
+    for s in sessions:
+        for p in s.get("promptList", []):
+            if p.get("images"):
+                p["images"] = [{"media_type": im.get("media_type", ""),
+                                "b64len": len(im.get("data", ""))} for im in p["images"]]
+
+
+# The client-side app. Injected into HTML_TEMPLATE at __APP_JS__ (kept separate so it can
+# be authored as a plain string). Works in two modes: api_mode=True talks to the local
+# server (live refresh / rename / delete); api_mode=False reads the embedded data island
+# (portable static export — read-only).
+APP_JS = r"""
+/* ================= Claude Code Sessions — client ================= */
+const API_MODE = __API_MODE__;
+let INCLUDE_ALL = __INCLUDE_ALL__;
+let GENERATED_AT = __GENERATED_JSON__;
+let NOTE = __NOTE_JSON__;
+
+let SESSIONS = [];
+let hiddenCount = 0;
+let firstRender = true;
+let ACTIVE = new Set();   // ids of sessions an agent is actively writing to (from /api/active)
+const $ = s => document.querySelector(s);
+
+let BOOT = null;
+try { BOOT = JSON.parse(document.getElementById('data').textContent); } catch(e){ BOOT = null; }
+
+/* ---- icons (Lucide, MIT; logo sunburst is bespoke) ---- */
+const SVG=(p,sz=15,sw=1.85)=>`<svg width="${sz}" height="${sz}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+const IC={
+  refresh: SVG('<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',15),
+  sun: SVG('<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',17),
+  moon: SVG('<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',17),
+  folder: SVG('<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',14),
+  folderOpen: SVG('<path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6a2 2 0 0 1-1.94 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/>',14),
+  branch: SVG('<line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>',13),
+  clock: SVG('<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',13),
+  calendar: SVG('<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/>',13),
+  hourglass: SVG('<path d="M5 22h14"/><path d="M5 2h14"/><path d="M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22"/><path d="M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2"/>',13),
+  activity: SVG('<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',13),
+  msg: SVG('<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',14),
+  copy: SVG('<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',13),
+  check: SVG('<polyline points="20 6 9 17 4 12"/>',15),
+  bookmark: SVG('<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>',11),
+  warn: SVG('<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',13),
+  chev: SVG('<path d="m6 9 6 6 6-6"/>',15),
+  info: SVG('<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',14),
+  image: SVG('<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',15),
+  edit: SVG('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>',13),
+  trash: SVG('<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',13),
+  resume: SVG('<polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/>',14),
+  convo: SVG('<path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4c0-1.1.9-2 2-2h8a2 2 0 0 1 2 2Z"/><path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/>',14),
+  tool: SVG('<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',12),
+  cpu: SVG('<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2M9 2v2M15 20v2M9 20v2M20 15h2M20 9h2M2 15h2M2 9h2"/>',13),
+  tokens: SVG('<line x1="4" x2="20" y1="9" y2="9"/><line x1="4" x2="20" y1="15" y2="15"/><line x1="10" x2="8" y1="3" y2="21"/><line x1="16" x2="14" y1="3" y2="21"/>',13),
+};
+
+/* ---- formatting helpers ---- */
+function esc(s){
+  return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+function fmtDur(ms){
+  if(!ms || ms<0) return "—";
+  const s=Math.round(ms/1000);
+  if(s<60) return s+"s";
+  const m=Math.round(s/60); if(m<60) return m+"m";
+  const h=Math.floor(m/60), rm=m%60; if(h<24) return rm?`${h}h ${rm}m`:`${h}h`;
+  const d=Math.floor(h/24), rh=h%24; return rh?`${d}d ${rh}h`:`${d}d`;
+}
+function relTime(iso){
+  if(!iso) return {label:"unknown", days:null};
+  const then=new Date(iso), now=new Date();
+  let diff=now-then; if(diff<0) diff=0;
+  const day=86400000, days=Math.floor(diff/day);
+  let label;
+  if(diff<60000) label="just now";
+  else if(diff<3600000) label=Math.round(diff/60000)+"m ago";
+  else if(diff<day) label=Math.round(diff/3600000)+"h ago";
+  else if(days===1) label="yesterday";
+  else if(days<30) label=days+" days ago";
+  else if(days<365) label=Math.round(days/30)+" mo ago";
+  else label=Math.round(days/365)+" yr ago";
+  return {label, days};
+}
+function fmtDate(iso){ if(!iso) return ""; try{ return new Date(iso).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'}); }catch(e){ return iso; } }
+function absTime(iso){ if(!iso) return ""; try{ return new Date(iso).toLocaleString(); }catch(e){ return iso; } }
+function fmtWhen(iso){ if(!iso) return ""; try{ return new Date(iso).toLocaleString(undefined,{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}); }catch(e){ return iso; } }
+function titleOf(s){ if(s.customTitle) return s.customTitle; if(s.aiTitle) return s.aiTitle; if(s.firstPrompt) return s.firstPrompt.slice(0,90); return "(untitled session)"; }
+function computeHay(s){
+  return (s.customTitle+" "+s.aiTitle+" "+s.firstPrompt+" "+s.cwd+" "+s.gitBranch+" "+s.id+" "
+    +(s.promptList||[]).map(p=>p.text).join(" ")).toLowerCase();
+}
+/* "claude-opus-4-8" -> "Opus 4.8"; strips a trailing date suffix */
+function modelName(id){
+  if(!id) return "";
+  let m=String(id).replace(/^claude-/,'').replace(/-\d{6,}$/,'');
+  const parts=m.split('-'); const fam=parts.shift()||m;
+  return (fam.charAt(0).toUpperCase()+fam.slice(1)+(parts.length?' '+parts.join('.'):'')).trim();
+}
+function fmtTok(n){ n=n||0; if(n<1000) return ''+n; if(n<1e6){ const k=n/1000; return (k<10?k.toFixed(1):Math.round(k))+'k'; } const mm=n/1e6; return (mm<10?mm.toFixed(2):mm.toFixed(1))+'M'; }
+function modelList(s){ return Object.entries(s.models||{}).sort((a,b)=>b[1]-a[1]); }
+
+/* Optional cost estimate. USD per 1M tokens, keyed by model-family prefix. These are
+   EXAMPLES — verify against current pricing and edit; leave empty to hide the $ figure.
+   Meaningless on a Claude subscription (Max/Pro), where usage isn't billed per token. */
+const SHOW_COST = true;
+const PRICING = {   // familyPrefix: {inputPerM, outputPerM}
+  'claude-opus':   {in:15, out:75},
+  'claude-sonnet': {in:3,  out:15},
+  'claude-haiku':  {in:0.8,out:4},
+  // 'claude-fable': {in:?, out:?},   // add rates to include Fable in the estimate
+};
+function priceFor(id){ for(const k in PRICING){ if(String(id).startsWith(k)) return PRICING[k]; } return null; }
+/* returns {usd, partial} using per-model turn share of tokens (approx), or null if unpriced */
+function estCost(s){
+  const models=modelList(s); if(!models.length || !(s.tokIn||s.tokOut)) return null;
+  const totalTurns=models.reduce((a,[,c])=>a+c,0)||1;
+  let usd=0, priced=0, unpriced=0;
+  for(const [id,c] of models){
+    const p=priceFor(id); const share=c/totalTurns;
+    if(p){ usd += (s.tokIn*share/1e6)*p.in + (s.tokOut*share/1e6)*p.out; priced++; }
+    else unpriced++;
+  }
+  if(!priced) return null;
+  return {usd, partial: unpriced>0};
+}
+
+/* ---- theme ---- */
+function effectiveTheme(){
+  const t=document.documentElement.getAttribute('data-theme');
+  if(t==='light'||t==='dark') return t;
+  return (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark':'light';
+}
+function updateThemeIcon(){
+  const dark=effectiveTheme()==='dark';
+  $('#themeIcon').innerHTML = dark?IC.sun:IC.moon;
+  $('#themeToggle').setAttribute('data-tip', dark?'Switch to light theme':'Switch to dark theme');
+}
+function setTheme(t){
+  document.documentElement.setAttribute('data-theme',t);
+  try{ localStorage.setItem('claude-sessions.theme',t); }catch(e){}
+  updateThemeIcon();
+}
+$('#themeToggle').addEventListener('click',()=>setTheme(effectiveTheme()==='dark'?'light':'dark'));
+if(window.matchMedia){ try{ matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{ if(!document.documentElement.getAttribute('data-theme')) updateThemeIcon(); }); }catch(e){} }
+
+/* ---- clipboard + toast ---- */
+async function copyText(text, okMsg){
+  let ok=false;
+  try{ if(navigator.clipboard && window.isSecureContext){ await navigator.clipboard.writeText(text); ok=true; } }catch(e){ ok=false; }
+  if(!ok){
+    const ta=document.createElement('textarea'); ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try{ ok=document.execCommand('copy'); }catch(e){ ok=false; }
+    document.body.removeChild(ta);
+  }
+  if(ok) showToast(IC.check, okMsg||"Copied", 'ok');
+  else { showToast(IC.warn,"Auto-copy blocked — copy manually",'warn'); window.prompt("Copy:", text); }
+}
+let toastTimer=null;
+function showToast(icon,msg,kind){
+  const t=$('#toast');
+  t.innerHTML=`<span class="ic-${kind==='warn'?'warn':'ok'}">${icon}</span><span>${esc(msg)}</span>`;
+  t.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),2200);
+}
+
+/* ---- data + server actions ---- */
+function prep(){ SESSIONS.forEach(s=>{ s._hay=computeHay(s); }); }
+async function apiGet(p){ const r=await fetch(p,{cache:'no-store'}); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+async function apiPost(p,body){
+  const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok){ let m='HTTP '+r.status; try{ const j=await r.json(); if(j.error)m=j.error; }catch(e){} throw new Error(m); }
+  return r.json();
+}
+function applyData(j){
+  SESSIONS=j.sessions||[]; hiddenCount=j.hidden||0; GENERATED_AT=j.generatedAt||GENERATED_AT;
+  prep(); buildProjectFilter(); render(); updateGenLine();
+}
+function setRefreshing(on){ const b=$('#refreshBtn'); if(!b) return; b.classList.toggle('spinning',on); b.disabled=on; }
+async function loadSessions(userInitiated){
+  if(!API_MODE){ SESSIONS=BOOT||[]; prep(); buildProjectFilter(); render(); updateGenLine(); $('#loading').hidden=true; return; }
+  setRefreshing(true);
+  try{
+    const j=await apiGet('/api/sessions'+(INCLUDE_ALL?'?all=1':''));
+    applyData(j);
+    if(userInitiated) showToast(IC.check,`Updated · ${SESSIONS.length} session${SESSIONS.length===1?'':'s'}`,'ok');
+  }catch(e){ showToast(IC.warn,'Refresh failed — is the server still running?','warn'); }
+  finally{ setRefreshing(false); $('#loading').hidden=true; }
+}
+async function doRename(s,name){
+  if(!API_MODE) return;
+  try{ const j=await apiPost('/api/rename',{id:s.id,name}); applyData(j); showToast(IC.check,'Renamed session','ok'); }
+  catch(e){ showToast(IC.warn,'Rename failed: '+e.message,'warn'); }
+}
+async function doDelete(s){
+  if(!API_MODE) return;
+  try{
+    const j=await apiPost('/api/delete',{ids:[s.id]});
+    if(j.refused && j.refused.length) showToast(IC.warn,"Can't delete a running session",'warn');
+    else showToast(IC.check,'Session deleted','ok');
+    applyData(j);
+  }
+  catch(e){ showToast(IC.warn,'Delete failed: '+e.message,'warn'); }
+}
+async function doReveal(s){
+  if(!API_MODE) return;
+  try{ await apiPost('/api/reveal',{cwd:s.cwd}); showToast(IC.check,'Opened project folder','ok'); }
+  catch(e){ showToast(IC.warn,'Could not open folder','warn'); }
+}
+/* live "running" indicator: poll the cheap /api/active endpoint and toggle a badge/bar */
+function applyActive(){
+  document.querySelectorAll('#grid .card').forEach(c=>{
+    const on=ACTIVE.has(c.dataset.id);
+    c.classList.toggle('live', on);
+    const del=c.querySelector('.act.delete');
+    if(del){ del.disabled=on; del.setAttribute('data-tip', on?"Can't delete a running session":"Delete this session permanently"); }
+  });
+}
+async function pollActive(){
+  if(!API_MODE) return;
+  try{
+    const j=await apiGet('/api/active');
+    const next=new Set(j.active||[]);
+    let changed = next.size!==ACTIVE.size;
+    if(!changed){ for(const id of next){ if(!ACTIVE.has(id)){ changed=true; break; } } }
+    ACTIVE=next;
+    if(changed) render(); else applyActive();   // re-render on change → running float to top + counter updates
+  }catch(e){}
+}
+
+/* ---- prompt history modal ---- */
+const overlay=$('#overlay');
+function fillModalStats(s){
+  const el=$('#modalStats'); if(!el) return;
+  const parts=[]; const models=modelList(s);
+  if(models.length) parts.push(`<span class="mstat" data-tip="Models used, by assistant turn count">${IC.cpu}${models.map(([m,c])=>`${esc(modelName(m))} <b>×${c}</b>`).join(', ')}</span>`);
+  if(s.tokOut||s.tokIn) parts.push(`<span class="mstat" data-tip="Tokens — cache-read is context re-read each turn via prompt caching">${IC.tokens}<b>${fmtTok(s.tokIn)}</b> in · <b>${fmtTok(s.tokOut)}</b> out · <b>${fmtTok(s.tokCacheRead)}</b> cache</span>`);
+  if(s.webSearches||s.webFetches){ const b=[]; if(s.webSearches) b.push(`<b>${s.webSearches}</b> web search${s.webSearches===1?'':'es'}`); if(s.webFetches) b.push(`<b>${s.webFetches}</b> fetch${s.webFetches===1?'':'es'}`); parts.push(`<span class="mstat">${b.join(', ')}</span>`); }
+  if(s.version) parts.push(`<span class="mstat" data-tip="Claude Code version">CC <b>v${esc(s.version)}</b></span>`);
+  if(SHOW_COST){ const c=estCost(s); if(c) parts.push(`<span class="mstat cost" data-tip="Rough estimate from the editable PRICING table (API list rates). Not meaningful on a Max/Pro subscription.">~$${c.usd<1?c.usd.toFixed(3):c.usd.toFixed(2)} est${c.partial?' (partial)':''}</span>`); }
+  el.innerHTML=parts.join(''); el.hidden=!parts.length;
+}
+function openModal(s){
+  $('#modalSearch').hidden=true;
+  $('#modalTitle').textContent = titleOf(s);
+  const n=(s.promptList||[]).length;
+  $('#modalSub').textContent = `${n} prompt${n===1?"":"s"} · ${s.cwd}`;
+  fillModalStats(s);
+  const body=$('#modalBody'); body.innerHTML="";
+  if(!n){ body.innerHTML='<div class="modal-empty">No prompts captured for this session.</div>'; }
+  (s.promptList||[]).forEach((p,i)=>{
+    const imgs=p.images||[], refs=p.imageRefs||[];
+    const imgCount=imgs.length+refs.length;
+    const item=document.createElement('div'); item.className="prompt";
+    const head=document.createElement('div'); head.className="prompt-head"; head.setAttribute('data-tip','Click to collapse / expand');
+    const metaLabel = imgCount ? ` · ${imgCount} image${imgCount===1?"":"s"}` : "";
+    const preview = p.text ? p.text.replace(/\s+/g," ").trim() : (imgCount ? `[${imgCount} image${imgCount===1?"":"s"}]` : "");
+    head.innerHTML =
+      `<span class="prompt-chev">${IC.chev}</span>`+
+      `<span class="prompt-n">#${i+1}</span>`+
+      `<span class="prompt-t">${esc(fmtWhen(p.t))}${metaLabel}</span>`+
+      `<span class="prompt-preview">${esc(preview)}</span>`;
+    if(p.text){
+      const cp=document.createElement('button'); cp.className="prompt-copy"; cp.type="button"; cp.setAttribute('aria-label','Copy this prompt'); cp.setAttribute('data-tip','Copy this prompt'); cp.innerHTML=IC.copy;
+      cp.addEventListener('click', e=>{ e.stopPropagation(); copyText(p.text,`Copied prompt #${i+1}`); });
+      head.appendChild(cp);
+    }
+    head.addEventListener('click', ()=>item.classList.toggle('collapsed'));
+    item.appendChild(head);
+    if(p.text){ const txt=document.createElement('div'); txt.className="prompt-text"; txt.textContent=p.text; item.appendChild(txt); }
+    if(imgs.length){
+      const wrap=document.createElement('div'); wrap.className="prompt-imgs";
+      imgs.forEach(im=>{
+        const a=document.createElement('a'); a.href=im.src; a.target="_blank"; a.rel="noopener"; a.setAttribute('data-tip','Open full image');
+        const img=document.createElement('img'); img.src=im.src; img.loading="lazy"; img.alt="pasted image";
+        a.appendChild(img); wrap.appendChild(a);
+      });
+      item.appendChild(wrap);
+    }
+    if(refs.length){
+      const wrap=document.createElement('div'); wrap.className="prompt-refs";
+      refs.forEach(r=>{ const el=document.createElement('div'); el.className="prompt-ref";
+        el.innerHTML=`${IC.image}<span>image not stored${r.note?` <span class="dim">· ${esc(r.note)}</span>`:""}</span>`; wrap.appendChild(el); });
+      item.appendChild(wrap);
+    }
+    if((p.text||"").length > 700) item.classList.add('collapsed');
+    body.appendChild(item);
+  });
+  body.scrollTop=0;
+  updateOrderBtn(); applyModalOrder();
+  presentOverlay();
+}
+function presentOverlay(){
+  overlay.hidden=false; requestAnimationFrame(()=>overlay.classList.add('show'));
+  document.body.style.overflow="hidden"; $('#modalClose').focus();
+}
+
+/* ---- full conversation (transcript) modal — lazily fetched from the server ---- */
+function openConversation(s, initialQuery){
+  $('#modalTitle').textContent = titleOf(s);
+  $('#modalSub').textContent = `Full conversation · ${s.cwd}`;
+  $('#modalSearch').hidden=false; $('#convSearch').value=''; convResetSearch(); updateOrderBtn(); fillModalStats(s);
+  const body=$('#modalBody');
+  body.innerHTML='<div class="modal-empty"><div class="spinner"></div><div style="margin-top:12px">Loading conversation…</div></div>';
+  presentOverlay();
+  apiGet('/api/conversation?id='+encodeURIComponent(s.id))
+    .then(j=>{ renderConversation(body, (j&&j.turns)||[]); applyModalOrder(); if(initialQuery){ $('#convSearch').value=initialQuery; convRunSearch(); } })
+    .catch(()=>{ body.innerHTML='<div class="modal-empty">Could not load this conversation.</div>'; });
+}
+
+/* ---- in-conversation search: highlight matches, navigate with ↑/↓ or Enter ---- */
+let convMarks=[], convIdx=-1, convT=null;
+function convResetSearch(){
+  convMarks=[]; convIdx=-1;
+  const c=$('#convCount'); if(c) c.textContent='';
+  const pv=$('#convPrev'), nx=$('#convNext'); if(pv) pv.disabled=true; if(nx) nx.disabled=true;
+}
+function convClearMarks(){
+  const b=$('#modalBody');
+  b.querySelectorAll('mark.hl').forEach(m=>{ m.parentNode.replaceChild(document.createTextNode(m.textContent), m); });
+  b.normalize();
+}
+function convUpdateCount(){
+  const c=$('#convCount'); if(!c) return;
+  c.textContent = convMarks.length ? `${convIdx+1}/${convMarks.length}` : ($('#convSearch').value.trim() ? '0/0' : '');
+  const dis=convMarks.length===0; $('#convPrev').disabled=dis; $('#convNext').disabled=dis;
+}
+function convFocusMark(){
+  convMarks.forEach((m,i)=>m.classList.toggle('hl-current', i===convIdx));
+  const m=convMarks[convIdx]; if(!m) return;
+  const tool=m.closest('.turn.tool'); if(tool) tool.classList.remove('collapsed');  // reveal matches inside collapsed tool rows
+  m.scrollIntoView({block:'center', behavior:'smooth'});
+}
+function convNav(d){ if(!convMarks.length) return; convIdx=(convIdx+d+convMarks.length)%convMarks.length; convFocusMark(); convUpdateCount(); }
+function convRunSearch(){
+  const q=$('#convSearch').value.trim();
+  convClearMarks(); convMarks=[]; convIdx=-1;
+  if(q){
+    const root=$('#modalBody'), ql=q.toLowerCase();
+    const walker=document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(n){ return (n.nodeValue && n.nodeValue.toLowerCase().includes(ql)) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT; }
+    });
+    const nodes=[]; let nd; while((nd=walker.nextNode())) nodes.push(nd);
+    nodes.forEach(node=>{
+      const text=node.nodeValue, lower=text.toLowerCase(); let from=0, idx; const frag=document.createDocumentFragment();
+      while((idx=lower.indexOf(ql, from))!==-1){
+        if(idx>from) frag.appendChild(document.createTextNode(text.slice(from,idx)));
+        const mk=document.createElement('mark'); mk.className='hl'; mk.textContent=text.slice(idx, idx+q.length); frag.appendChild(mk); convMarks.push(mk);
+        from=idx+q.length;
+      }
+      if(from<text.length) frag.appendChild(document.createTextNode(text.slice(from)));
+      node.parentNode.replaceChild(frag, node);
+    });
+    if(convMarks.length){ convIdx=0; convFocusMark(); }
+  }
+  convUpdateCount();
+}
+/* render text with fenced ``` code blocks; everything is added via textContent (XSS-safe) */
+function appendRich(parent, text){
+  const parts=String(text||"").split('```');
+  parts.forEach((seg,i)=>{
+    if(i%2===1){
+      let code=seg; const nl=seg.indexOf('\n'); const first=nl>=0?seg.slice(0,nl).trim():"";
+      if(nl>=0 && first && !/\s/.test(first) && first.length<=20) code=seg.slice(nl+1);  // drop a bare language tag
+      const pre=document.createElement('pre'); pre.className='code'; pre.textContent=code.replace(/\n+$/,''); parent.appendChild(pre);
+    } else if(seg.replace(/\s/g,'')){
+      const div=document.createElement('div'); div.className='ptext'; div.textContent=seg.replace(/^\n+|\n+$/g,''); parent.appendChild(div);
+    }
+  });
+  if(!parent.childNodes.length){ const div=document.createElement('div'); div.className='ptext'; div.textContent=String(text||""); parent.appendChild(div); }
+}
+
+/* ---- minimal, dependency-free, XSS-safe markdown renderer (assistant turns) ---- */
+function mdSafeUrl(u){ u=String(u||'').trim(); return /^(https?:|mailto:|\/|#|\.)/i.test(u) ? u : '#'; }
+function mdInline(parent, text){
+  const re=/(`+)([\s\S]+?)\1|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|\*(?!\s)([\s\S]*?\S)\*|_(?!\s)([\s\S]*?\S)_|\[([^\]]+)\]\(([^)\s]+)\)/g;
+  let last=0, m;
+  while((m=re.exec(text))){
+    if(m.index>last) parent.appendChild(document.createTextNode(text.slice(last,m.index)));
+    if(m[2]!==undefined){ const c=document.createElement('code'); c.textContent=m[2]; parent.appendChild(c); }
+    else if(m[3]!==undefined||m[4]!==undefined){ const b=document.createElement('strong'); mdInline(b, m[3]!==undefined?m[3]:m[4]); parent.appendChild(b); }
+    else if(m[5]!==undefined||m[6]!==undefined){ const e=document.createElement('em'); mdInline(e, m[5]!==undefined?m[5]:m[6]); parent.appendChild(e); }
+    else if(m[7]!==undefined){ const a=document.createElement('a'); a.textContent=m[7]; a.href=mdSafeUrl(m[8]); a.target='_blank'; a.rel='noopener noreferrer'; parent.appendChild(a); }
+    last=re.lastIndex;
+  }
+  if(last<text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+function mdBlocks(container, text){
+  const lines=text.split('\n');
+  let para=[], list=null, listType=null;
+  const flushPara=()=>{ if(para.length){ const p=document.createElement('div'); p.className='md-p'; mdInline(p, para.join('\n')); container.appendChild(p); para=[]; } };
+  const flushList=()=>{ if(list){ container.appendChild(list); list=null; listType=null; } };
+  for(const line of lines){
+    const t=line.trim(); let m;
+    if(!t){ flushPara(); flushList(); continue; }
+    if((m=/^(#{1,6})\s+(.*)$/.exec(t))){ flushPara(); flushList(); const h=document.createElement('div'); h.className='md-h md-h'+m[1].length; mdInline(h,m[2]); container.appendChild(h); continue; }
+    if(/^([-*_])\1{2,}$/.test(t)){ flushPara(); flushList(); const hr=document.createElement('div'); hr.className='md-hr'; container.appendChild(hr); continue; }
+    if((m=/^>\s?(.*)$/.exec(t))){ flushPara(); flushList(); const bq=document.createElement('div'); bq.className='md-bq'; mdInline(bq,m[1]); container.appendChild(bq); continue; }
+    if((m=/^[-*+]\s+(.*)$/.exec(t))){ flushPara(); if(listType!=='ul'){ flushList(); list=document.createElement('ul'); list.className='md-ul'; listType='ul'; } const li=document.createElement('li'); mdInline(li,m[1]); list.appendChild(li); continue; }
+    if((m=/^(\d+)[.)]\s+(.*)$/.exec(t))){ flushPara(); if(listType!=='ol'){ flushList(); list=document.createElement('ol'); list.className='md-ol'; listType='ol'; } const li=document.createElement('li'); mdInline(li,m[2]); list.appendChild(li); continue; }
+    flushList(); para.push(line);
+  }
+  flushPara(); flushList();
+}
+function renderMarkdown(container, text){
+  const src=String(text||'').replace(/\r\n?/g,'\n');
+  src.split('```').forEach((seg,i)=>{
+    if(i%2===1){
+      let code=seg; const nl=seg.indexOf('\n'); const first=nl>=0?seg.slice(0,nl).trim():'';
+      if(nl>=0 && first && !/\s/.test(first) && first.length<=20) code=seg.slice(nl+1);
+      const pre=document.createElement('pre'); pre.className='code'; pre.textContent=code.replace(/\n+$/,''); container.appendChild(pre);
+    } else if(seg.trim()){ mdBlocks(container, seg.replace(/^\n+|\n+$/g,'')); }
+  });
+  if(!container.childNodes.length){ const p=document.createElement('div'); p.className='md-p'; p.textContent=text||''; container.appendChild(p); }
+}
+function turnEl(t){
+  const el=document.createElement('div'); el.className='turn '+t.role+(t.isError?' err':'');
+  const head=document.createElement('div'); head.className='turn-head';
+  const isTool = t.role==='tool_use' || t.role==='tool_result';
+  const who = t.role==='user'?'You' : t.role==='assistant'?('Claude'+(t._showModel?' · '+modelName(t.model):'')) : t.role==='tool_use'?('used '+(t.tool||'tool')) : 'tool result';
+  head.innerHTML=`<span class="who">${isTool?IC.tool:''}${esc(who)}</span><span class="tt">${esc(fmtWhen(t.t))}</span>`;
+  el.appendChild(head);
+  if(isTool){
+    el.classList.add('tool','collapsed');
+    head.addEventListener('click', ()=>el.classList.toggle('collapsed'));
+    const pre=document.createElement('pre'); pre.className='code'; pre.textContent = (t.role==='tool_use'?t.input:t.text) || '';
+    el.appendChild(pre);
+  } else {
+    const c=document.createElement('div'); c.className='turn-body';
+    if(t.role==='assistant') renderMarkdown(c, t.text||''); else appendRich(c, t.text||t.note||'');
+    el.appendChild(c);
+  }
+  return el;
+}
+function renderConversation(body, turns){
+  body.innerHTML="";
+  if(!turns.length){ body.innerHTML='<div class="modal-empty">No conversation content found for this session.</div>'; return; }
+  const wrap=document.createElement('div'); wrap.className='convo-wrap';
+  let lastModel=null;
+  turns.forEach(t=>{
+    if(t.role==='assistant' && t.model && t.model!==lastModel){ t._showModel=true; lastModel=t.model; }
+    wrap.appendChild(turnEl(t));
+  });
+  body.appendChild(wrap); body.scrollTop=0;
+}
+function closeModal(){ overlay.classList.remove('show'); document.body.style.overflow=""; $('#modalSearch').hidden=true; $('#modalStats').hidden=true; $('#convSearch').value=""; setTimeout(()=>{ overlay.hidden=true; },200); }
+const setAllCollapsed = v => $('#modalBody').querySelectorAll('.prompt, .turn.tool').forEach(p=>p.classList.toggle('collapsed', v));
+
+/* oldest ↔ newest ordering for the prompts & conversation modals (renders oldest-first, then flips) */
+let modalOrder='oldest';
+function reverseModalItems(){
+  const body=$('#modalBody');
+  const container = body.querySelector('.convo-wrap') || body;
+  const items=[...container.children].filter(el=>el.classList && (el.classList.contains('prompt')||el.classList.contains('turn')));
+  items.reverse().forEach(el=>container.appendChild(el));
+}
+function applyModalOrder(){ if(modalOrder==='newest') reverseModalItems(); }
+function updateOrderBtn(){ const b=$('#orderToggle'); if(b) b.textContent = modalOrder==='newest' ? 'Newest first' : 'Oldest first'; }
+
+/* ---- inline rename ---- */
+function beginInlineRename(s,card){
+  const titleEl=card.querySelector('.title'); if(!titleEl||card.querySelector('.title-input')) return;
+  const original=s.customTitle||"";
+  const input=document.createElement('input'); input.type="text"; input.className="title-input"; input.value=original;
+  input.placeholder=s.aiTitle||(s.firstPrompt||"").slice(0,60)||"Untitled session"; input.maxLength=200; input.setAttribute('aria-label','Session name');
+  titleEl.replaceWith(input); input.focus(); input.select();
+  let settled=false;
+  function restore(){ if(input.parentNode) input.replaceWith(titleEl); }
+  function cancel(){ if(settled) return; settled=true; restore(); }
+  function commit(){ if(settled) return; settled=true; restore(); const val=input.value.trim(); if(!val||val===original) return; doRename(s,val); }
+  input.addEventListener('click', e=>e.stopPropagation());
+  input.addEventListener('mousedown', e=>e.stopPropagation());
+  input.addEventListener('keydown', e=>{ e.stopPropagation(); if(e.key==='Enter'){ e.preventDefault(); commit(); } else if(e.key==='Escape'){ e.preventDefault(); cancel(); } });
+  input.addEventListener('blur', commit);
+}
+
+/* ---- inline delete confirm ---- */
+function armDelete(card,s){
+  const bar=card.querySelector('.actions'); if(!bar) return;
+  bar.innerHTML=`<span class="confirm-txt">${IC.warn}Delete permanently?</span><span class="act-spacer"></span>`+
+    `<button class="act cancel" type="button">Cancel</button>`+
+    `<button class="act solid confirm" type="button">${IC.trash}Delete</button>`;
+  bar.querySelector('.cancel').addEventListener('click', e=>{ e.stopPropagation(); render(); });
+  bar.querySelector('.confirm').addEventListener('click', e=>{ e.stopPropagation(); doDelete(s); });
+}
+
+/* ---- render ---- */
+function buildProjectFilter(){
+  const sel=$('#proj'); const prev=sel.value;
+  const projs=[...new Set(SESSIONS.map(s=>s.cwd))].sort();
+  sel.innerHTML="";
+  const all=document.createElement('option'); all.value=""; all.textContent=`All projects (${projs.length})`; sel.appendChild(all);
+  for(const p of projs){ const o=document.createElement('option'); o.value=p;
+    o.textContent=`${p.split('/').pop()||p}  (${SESSIONS.filter(s=>s.cwd===p).length})`; sel.appendChild(o); }
+  if(prev && projs.includes(prev)) sel.value=prev;
+}
+function updateGenLine(){
+  const el=$('#genline'); if(!el) return;
+  const mode = API_MODE ? 'live · Refresh reloads from disk' : 'static export · read-only';
+  let s=`<span>Updated <b>${esc(GENERATED_AT)}</b></span><span>·</span><span>${mode}</span>`;
+  if(hiddenCount>0) s+=`<span>·</span><span>${hiddenCount} SDK/agent session${hiddenCount===1?'':'s'} hidden</span>`;
+  el.innerHTML=s;
+}
+function buildCard(s,i){
+  const rel=relTime(s.lastTs);
+  const ageCls = rel.days==null ? "" : (rel.days<=3 ? "fresh" : (rel.days>=30 ? "old":""));
+  const card=document.createElement('div');
+  card.className="card"+(s.customTitle?" named":"")+(ACTIVE.has(s.id)?" live":"")+(firstRender?" enter":"");
+  card.dataset.id=s.id;
+  card.style.setProperty('--i', Math.min(i,26));
+  card.tabIndex=0; card.setAttribute('role','button'); card.setAttribute('aria-label','Resume session '+titleOf(s));
+
+  const badges=[];
+  // named sessions are signalled by the accent-coloured title (see .card.named .title), not a pill
+  if(s.ambiguous) badges.push(`<span class="badge warn" data-tip="Name shared by several sessions — resumes by unique id">${IC.warn}</span>`);
+  badges.push(`<span class="runningdot" data-tip="An agent is actively writing to this session"></span>`);
+  const activeChip = s.activeMs>0 ? `<span class="chip" data-tip="Active working time (sum of turn durations)">${IC.activity}active <b>${fmtDur(s.activeMs)}</b></span>` : "";
+  const _models = modelList(s);
+  const modelChip = _models.length
+    ? `<span class="chip model" data-tip="${esc(_models.map(([m,c])=>modelName(m)+' ×'+c).join(' · '))}">${IC.cpu}<b>${esc(modelName(_models[0][0]))}</b>${_models.length>1?` +${_models.length-1}`:""}</span>`
+    : "";
+  const tokChip = s.tokOut
+    ? `<span class="chip" data-tip="${fmtTok(s.tokIn)} in · ${fmtTok(s.tokOut)} out · ${fmtTok(s.tokCacheRead)} cache-read">${IC.tokens}<b>${fmtTok(s.tokOut)}</b> out</span>`
+    : "";
+  const pc=s.prompts;
+  const promptsBtn = pc>0
+    ? `<button class="prompts-btn" type="button">${IC.msg}View <span class="cnt">${pc}</span> prompt${pc===1?"":"s"}</button>`
+    : `<button class="prompts-btn" type="button" disabled>${IC.msg}No prompts captured</button>`;
+  const convoBtn = API_MODE ? `<button class="prompts-btn convo" type="button">${IC.convo}Conversation</button>` : "";
+  const actionsRow = API_MODE ? `
+    <div class="actions">
+      <button class="act rename" type="button" data-tip="Rename this session">${IC.edit}Rename</button>
+      <button class="act open" type="button" data-tip="Open project folder in your file manager">${IC.folderOpen}Open</button>
+      <span class="act-spacer"></span>
+      <button class="act delete" type="button"${ACTIVE.has(s.id)?" disabled":""} data-tip="${ACTIVE.has(s.id)?"Can't delete a running session":"Delete this session permanently"}">${IC.trash}Delete</button>
+    </div>` : "";
+
+  card.innerHTML=`
+    <div class="row1"><div class="title">${esc(titleOf(s))}</div><div class="badges">${badges.join("")}</div></div>
+    <div class="pathline">
+      <span class="p" data-tip="${esc(s.cwd)}">${IC.folder}<span class="ptxt">${esc(s.cwdShort||s.cwd)}</span></span>
+      ${s.gitBranch?`<span class="br" data-tip="git branch">${IC.branch}<span class="brtxt">${esc(s.gitBranch)}</span></span>`:""}
+    </div>
+    <div class="meta">
+      <span class="chip ${ageCls}" data-tip="${esc(absTime(s.lastTs))}">${IC.clock}<b>${esc(rel.label)}</b></span>
+      <span class="chip" data-tip="Last activity date">${IC.calendar}<b>${esc(fmtDate(s.lastTs))||"?"}</b></span>
+      <span class="chip ${ageCls}" data-tip="Days since last activity">${rel.days==null?"?":rel.days} ${rel.days===1?"day":"days"} old</span>
+      <span class="chip" data-tip="Session duration (first → last activity)">${IC.hourglass}<b>${fmtDur(s.spanMs)}</b></span>
+      ${activeChip}${modelChip}${tokChip}
+    </div>
+    <div class="btnrow">${promptsBtn}${convoBtn}</div>
+    <div class="cmdrow">
+      <button class="cmd" type="button" data-tip="${esc(s.resumeCmd)}">${esc(s.resumeCmd)}</button>
+      <button class="resume" type="button">${IC.resume}Resume</button>
+    </div>
+    ${actionsRow}`;
+
+  card.addEventListener('click', ()=>copyText(s.resumeCmd,"Copied resume command"));
+  card.addEventListener('keydown', e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); copyText(s.resumeCmd,"Copied resume command"); }});
+  card.querySelector('.cmd').addEventListener('click', e=>{ e.stopPropagation(); copyText(s.resumeCmd,"Copied resume command"); });
+  card.querySelector('.resume').addEventListener('click', e=>{ e.stopPropagation(); copyText(s.resumeCmd,"Copied resume command"); });
+  const pb=card.querySelector('.prompts-btn');
+  if(pc>0) pb.addEventListener('click', e=>{ e.stopPropagation(); openModal(s); });
+  else pb.addEventListener('click', e=>e.stopPropagation());
+  const cb=card.querySelector('.convo');
+  if(cb) cb.addEventListener('click', e=>{ e.stopPropagation(); openConversation(s); });
+  if(API_MODE){
+    card.querySelector('.rename').addEventListener('click', e=>{ e.stopPropagation(); beginInlineRename(s,card); });
+    card.querySelector('.open').addEventListener('click', e=>{ e.stopPropagation(); doReveal(s); });
+    card.querySelector('.delete').addEventListener('click', e=>{ e.stopPropagation();
+      if(ACTIVE.has(s.id)){ showToast(IC.warn,"Can't delete a running session",'warn'); return; }
+      armDelete(card,s); });
+  }
+  return card;
+}
+function render(){
+  const q=$('#q').value.trim().toLowerCase();
+  const proj=$('#proj').value, sort=$('#sort').value, onlynamed=$('#onlynamed').checked;
+  let rows=SESSIONS.filter(s=>{
+    if(onlynamed && !s.customTitle) return false;
+    if(proj && s.cwd!==proj) return false;
+    if(q && !s._hay.includes(q)) return false;
+    return true;
+  });
+  rows.sort((a,b)=>{
+    switch(sort){
+      case "oldest":  return (a.lastTs||"").localeCompare(b.lastTs||"");
+      case "span":    return b.spanMs-a.spanMs;
+      case "prompts": return b.prompts-a.prompts;
+      case "named":   return (b.hasName-a.hasName)||((b.lastTs||"").localeCompare(a.lastTs||""));
+      case "project": return a.cwd.localeCompare(b.cwd)||((b.lastTs||"").localeCompare(a.lastTs||""));
+      default:        return (b.lastTs||"").localeCompare(a.lastTs||"");
+    }
+  });
+  // running sessions float to the top (stable within each group)
+  rows.sort((a,b)=> (ACTIVE.has(b.id)?1:0)-(ACTIVE.has(a.id)?1:0));
+  const grid=$('#grid'), empty=$('#empty');
+  grid.innerHTML=""; empty.hidden=rows.length>0;
+  const frag=document.createDocumentFragment();
+  rows.forEach((s,i)=>frag.appendChild(buildCard(s,i)));
+  grid.appendChild(frag);
+
+  const projCount=new Set(SESSIONS.map(s=>s.cwd)).size;
+  const running=SESSIONS.filter(s=>ACTIVE.has(s.id)).length;
+  $('#stats').innerHTML =
+    (running>0?`<span class="stat live" data-tip="Sessions an agent is actively writing to"><span class="livedot"></span><b>${running}</b><span>running</span></span>`:"")+
+    `<span class="stat"><b>${rows.length}</b><span>of ${SESSIONS.length} shown</span></span>`+
+    `<span class="stat"><b>${SESSIONS.filter(s=>s.hasName).length}</b><span>named</span></span>`+
+    `<span class="stat"><b>${projCount}</b><span>projects</span></span>`;
+  firstRender=false;
+}
+
+/* ---- init ---- */
+updateThemeIcon();
+$('#refreshIcon').innerHTML=IC.refresh;
+{ const _i=$('#infoIcon'); if(_i) _i.innerHTML=IC.info; }
+['q','proj','sort','onlynamed'].forEach(id=>{ const el=$('#'+id); el.addEventListener('input',render); el.addEventListener('change',render); });
+$('#refreshBtn').addEventListener('click',()=>loadSessions(true));
+if(API_MODE){
+  const w=$('#allWrap'); if(w) w.hidden=false;
+  const cb=$('#showall'); if(cb){ cb.checked=INCLUDE_ALL; cb.addEventListener('change',()=>{ INCLUDE_ALL=cb.checked; loadSessions(true); }); }
+}
+overlay.addEventListener('click', e=>{ if(e.target===overlay) closeModal(); });
+$('#modalClose').addEventListener('click', closeModal);
+document.addEventListener('keydown', e=>{ if(e.key==="Escape" && !overlay.hidden) closeModal(); });
+$('#expandAll').addEventListener('click', ()=>setAllCollapsed(false));
+$('#collapseAll').addEventListener('click', ()=>setAllCollapsed(true));
+$('#orderToggle').addEventListener('click', ()=>{
+  modalOrder = modalOrder==='oldest' ? 'newest' : 'oldest';
+  updateOrderBtn(); reverseModalItems();
+  if(!$('#modalSearch').hidden && $('#convSearch').value) convRunSearch();  // re-highlight after reorder
+});
+
+/* conversation search */
+$('#convPrev').innerHTML=IC.chev; $('#convNext').innerHTML=IC.chev;
+$('#convSearch').addEventListener('input', ()=>{ clearTimeout(convT); convT=setTimeout(convRunSearch, 120); });
+$('#convSearch').addEventListener('keydown', e=>{
+  if(e.key==='Enter'){ e.preventDefault(); convNav(e.shiftKey?-1:1); }
+  else if(e.key==='Escape' && $('#convSearch').value){ e.preventDefault(); e.stopPropagation(); $('#convSearch').value=''; convRunSearch(); }
+});
+$('#convPrev').addEventListener('click', ()=>convNav(-1));
+$('#convNext').addEventListener('click', ()=>convNav(1));
+document.addEventListener('keydown', e=>{
+  if((e.metaKey||e.ctrlKey) && (e.key==='f'||e.key==='F') && !overlay.hidden && !$('#modalSearch').hidden){
+    e.preventDefault(); const cs=$('#convSearch'); cs.focus(); cs.select();
+  }
+});
+
+/* ---- themed hover/focus tooltips for any [data-tip] element ---- */
+(function(){
+  const el=$('#tooltip'); if(!el) return;
+  let cur=null;
+  function place(t){
+    const r=t.getBoundingClientRect(), tw=el.offsetWidth, th=el.offsetHeight;
+    let left=r.left + r.width/2 - tw/2;
+    let top=r.top - th - 6;                       // prefer above
+    if(top < 6) top = r.bottom + 6;               // flip below if no room
+    left=Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+    el.style.left=left+'px'; el.style.top=top+'px';
+  }
+  function show(t){
+    const txt=t.getAttribute('data-tip'); if(!txt){ hide(); return; }
+    el.textContent=txt; el.setAttribute('aria-hidden','false'); el.classList.add('show'); place(t); cur=t;
+  }
+  function hide(){ if(!cur){ return; } el.classList.remove('show'); el.setAttribute('aria-hidden','true'); cur=null; }
+  document.addEventListener('mouseover', e=>{ const t=e.target.closest?e.target.closest('[data-tip]'):null; if(t){ if(t!==cur) show(t); } else if(cur) hide(); });
+  document.addEventListener('mouseout', e=>{ const t=e.target.closest?e.target.closest('[data-tip]'):null; if(t && (!e.relatedTarget || !t.contains(e.relatedTarget))) hide(); });
+  document.addEventListener('focusin', e=>{ const t=e.target.closest?e.target.closest('[data-tip]'):null; if(t) show(t); });
+  document.addEventListener('focusout', hide);
+  window.addEventListener('scroll', hide, true);
+  window.addEventListener('resize', hide);
+})();
+
+/* deep-link: ?conversation=<id> or ?prompts=<id> auto-opens that session on load */
+loadSessions(false).then(()=>{ try{
+  const p=new URLSearchParams(location.search);
+  const ord=p.get('order'); if(ord==='newest'||ord==='oldest') modalOrder=ord;
+  const cid=p.get('conversation');
+  if(cid && API_MODE){ const s=SESSIONS.find(x=>x.id===cid); if(s){ openConversation(s, p.get('find')||''); return; } }
+  const pid=p.get('prompts');
+  if(pid){ const s=SESSIONS.find(x=>x.id===pid); if(s) openModal(s); }
+}catch(e){} });
+if(API_MODE){ pollActive(); setInterval(pollActive, 7000); }
+"""
+
+
+def build_html(sessions, generated_at, note="", api_mode=False, include_all=False):
+    """Fill the template. In api_mode the data island is `null` (the client fetches live);
+    otherwise the sessions are embedded for a portable, read-only static export."""
+    out = HTML_TEMPLATE
+    out = out.replace("__APP_JS__", APP_JS)
+    out = out.replace("__API_MODE__", "true" if api_mode else "false")
+    out = out.replace("__INCLUDE_ALL__", "true" if include_all else "false")
+    out = out.replace("__GENERATED_JSON__", json.dumps(generated_at))
+    out = out.replace("__NOTE_JSON__", json.dumps(note))
+    for marker, svg in _SHELL_ICONS.items():
+        out = out.replace(marker, svg)
+    # __DATA__ goes in LAST so arbitrary session text can never clobber a template marker.
+    if api_mode:
+        data = "null"
+    else:
+        # Escaping "<" as the JSON unicode escape keeps "</script>" from breaking the island.
+        data = json.dumps(sessions, ensure_ascii=False).replace("<", "\\u003c")
+    out = out.replace("__DATA__", data)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Local server (default mode) — makes Refresh / Rename / Delete one-click
+# --------------------------------------------------------------------------- #
+import http.server
+import mimetypes
+import subprocess
+import time
+import urllib.parse
+
+# A session is flagged "running" if its .jsonl was written within this many seconds — a
+# cheap heuristic for "an agent is actively working in it right now".
+ACTIVE_WINDOW_S = 60
+
+_FAVICON = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#C96442" '
+    'stroke-width="2.4" stroke-linecap="round"><line x1="3" y1="12" x2="21" y2="12"/>'
+    '<line x1="12" y1="3" x2="12" y2="21"/><line x1="4.2" y1="7.5" x2="19.8" y2="16.5"/>'
+    '<line x1="7.5" y1="4.2" x2="16.5" y2="19.8"/><line x1="16.5" y1="4.2" x2="7.5" y2="19.8"/>'
+    '<line x1="19.8" y1="7.5" x2="4.2" y2="16.5"/></svg>'
+).encode("utf-8")
+
+
+def _reveal_in_file_manager(path):
+    """Open a directory in the OS file manager. Returns True on success."""
+    path = os.path.expanduser(path or "")
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        elif os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception:
+        return False
+
+
+def _api_payload(root, include_all, assets_dir):
+    """Fresh rescan of disk -> JSON-serialisable payload for the client."""
+    sessions, hidden = collect(root, include_all=include_all)
+    externalize_images(sessions, assets_dir)  # writes files, rewrites image entries to {src, media_type}
+    for s in sessions:
+        s.pop("filePath", None)  # internal only; keep it off the wire
+        for p in s.get("promptList", []):
+            for im in (p.get("images") or []):
+                if isinstance(im, dict) and im.get("src") and not im["src"].startswith("/"):
+                    im["src"] = "/" + im["src"]  # server needs absolute URL paths
+    generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    return {"sessions": sessions, "hidden": hidden, "generatedAt": generated_at}
+
+
+_TURN_TEXT_CAP = 16000
+_TOOL_CAP = 1200
+
+
+def _cap_text(s, n):
+    s = s or ""
+    if len(s) <= n:
+        return s
+    return s[:n] + "\n\n… [truncated {:,} more characters]".format(len(s) - n)
+
+
+def _flatten_tool_result(rc):
+    if isinstance(rc, str):
+        return rc
+    if isinstance(rc, list):
+        out = []
+        for b in rc:
+            if isinstance(b, dict) and b.get("type") == "text":
+                out.append(b.get("text", ""))
+            elif isinstance(b, str):
+                out.append(b)
+        return "\n".join(o for o in out if o)
+    return ""
+
+
+def read_conversation(path):
+    """Parse one session .jsonl into an ordered list of turns for the transcript view:
+    user / assistant text, plus compact tool_use and tool_result entries. Thinking blocks
+    and injected system-reminder / slash-command noise are omitted."""
+    turns = []
+    try:
+        fh = open(path, "r", errors="replace")
+    except OSError:
+        return turns
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(d, dict):
+                continue
+            typ = d.get("type")
+            ts = d.get("timestamp", "") or ""
+            msg = d.get("message")
+            if typ == "user":
+                content = msg.get("content") if isinstance(msg, dict) else msg
+                if isinstance(content, str):
+                    txt, _ = process_image_annotations(content.strip())
+                    if txt and looks_like_real_prompt(txt):
+                        turns.append({"role": "user", "text": _cap_text(txt, _TURN_TEXT_CAP), "t": ts})
+                elif isinstance(content, list):
+                    parts, imgs = [], 0
+                    for b in content:
+                        if isinstance(b, str):
+                            parts.append(b)
+                        elif isinstance(b, dict):
+                            bt = b.get("type")
+                            if bt == "text":
+                                parts.append(b.get("text", ""))
+                            elif bt == "image":
+                                imgs += 1
+                            elif bt == "tool_result":
+                                rt = _flatten_tool_result(b.get("content"))
+                                turns.append({"role": "tool_result", "text": _cap_text(rt, _TOOL_CAP),
+                                              "t": ts, "isError": bool(b.get("is_error"))})
+                    txt, _ = process_image_annotations("\n".join(p for p in parts if p).strip())
+                    if txt and looks_like_real_prompt(txt):
+                        turns.append({"role": "user", "text": _cap_text(txt, _TURN_TEXT_CAP), "t": ts})
+                    elif imgs and not txt:
+                        turns.append({"role": "user", "note": "[{} pasted image{}]".format(imgs, "" if imgs == 1 else "s"), "t": ts})
+            elif typ == "assistant":
+                content = msg.get("content") if isinstance(msg, dict) else None
+                mdl = msg.get("model") if isinstance(msg, dict) else None
+                if mdl == "<synthetic>":
+                    mdl = None
+                if isinstance(content, str):
+                    tx = content.strip()
+                    if tx:
+                        turns.append({"role": "assistant", "text": _cap_text(tx, _TURN_TEXT_CAP), "t": ts, "model": mdl})
+                elif isinstance(content, list):
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        bt = b.get("type")
+                        if bt == "text":
+                            tx = (b.get("text") or "").strip()
+                            if tx:
+                                turns.append({"role": "assistant", "text": _cap_text(tx, _TURN_TEXT_CAP), "t": ts, "model": mdl})
+                        elif bt == "tool_use":
+                            inp = b.get("input")
+                            inps = inp if isinstance(inp, str) else json.dumps(inp, ensure_ascii=False, indent=2)
+                            turns.append({"role": "tool_use", "tool": b.get("name", "tool"),
+                                          "input": _cap_text(inps or "", _TOOL_CAP), "t": ts})
+                        # thinking blocks intentionally omitted
+    return turns
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "ClaudeSessions/2.0"
+
+    # --- helpers ---
+    def log_message(self, *a):  # keep the console quiet
+        pass
+
+    def _cfg(self):
+        return self.server.cfg
+
+    def _guard_host(self):
+        # Only accept loopback Host headers (blocks DNS-rebinding from a browsing site).
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if host in ("127.0.0.1", "localhost", "::1", ""):
+            return True
+        self._send(403, b"forbidden", "text/plain")
+        return False
+
+    def _send(self, code, body, ctype, extra=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
+
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b""
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    # --- routes ---
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        if not self._guard_host():
+            return
+        cfg = self._cfg()
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path in ("/", "/index.html"):
+            self._send(200, cfg["html"], "text/html; charset=utf-8")
+            return
+        if path == "/api/sessions":
+            qs = urllib.parse.parse_qs(parsed.query)
+            all_q = qs.get("all", [""])[0]
+            include_all = cfg["include_all"] or (all_q not in ("", "0", "false"))
+            try:
+                self._json(_api_payload(cfg["root"], include_all, cfg["assets_dir"]))
+            except Exception as e:  # never crash the handler thread
+                self._json({"error": str(e)}, 500)
+            return
+        if path == "/api/active":
+            now = time.time()
+            ids = []
+            for p in glob.glob(os.path.join(cfg["root"], "*", "*.jsonl")):
+                try:
+                    if now - os.path.getmtime(p) <= ACTIVE_WINDOW_S:
+                        ids.append(os.path.splitext(os.path.basename(p))[0])
+                except OSError:
+                    continue
+            self._json({"active": ids, "windowS": ACTIVE_WINDOW_S})
+            return
+        if path == "/api/conversation":
+            sid = urllib.parse.parse_qs(parsed.query).get("id", [""])[0].strip()
+            if not re.match(r"^[A-Za-z0-9._-]+$", sid):  # guards against path traversal
+                self._json({"error": "invalid id"}, 400)
+                return
+            matches = glob.glob(os.path.join(cfg["root"], "*", sid + ".jsonl"))
+            if not matches:
+                self._json({"error": "session not found"}, 404)
+                return
+            try:
+                self._json({"id": sid, "turns": read_conversation(matches[0])})
+            except Exception as e:
+                self._json({"error": str(e)}, 500)
+            return
+        if path == "/favicon.ico":
+            self._send(200, _FAVICON, "image/svg+xml")
+            return
+        if path.startswith("/" + ASSETS_DIRNAME + "/"):
+            self._serve_asset(cfg["assets_dir"], path)
+            return
+        self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        if not self._guard_host():
+            return
+        # Require a JSON content-type: browsers force a CORS preflight for cross-site JSON
+        # POSTs (which we don't answer), and HTML forms can't set it — a simple CSRF guard.
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            self._json({"error": "content-type must be application/json"}, 415)
+            return
+        cfg = self._cfg()
+        path = urllib.parse.urlparse(self.path).path
+        body = self._read_json()
+        if body is None or not isinstance(body, dict):
+            self._json({"error": "invalid JSON body"}, 400)
+            return
+        try:
+            if path == "/api/rename":
+                sid = (body.get("id") or body.get("token") or "").strip()
+                name = (body.get("name") or "").strip()
+                if not sid or not name:
+                    self._json({"error": "id and name are required"}, 400)
+                    return
+                if rename_session(cfg["root"], sid, name) is None:
+                    self._json({"error": "session not found"}, 404)
+                    return
+                self._json(_api_payload(cfg["root"], cfg["include_all"], cfg["assets_dir"]))
+                return
+            if path == "/api/delete":
+                ids = body.get("ids") or ([body["id"]] if body.get("id") else [])
+                ids = [str(x).strip() for x in ids if str(x).strip()]
+                if not ids:
+                    self._json({"error": "ids are required"}, 400)
+                    return
+                # never delete a session an agent is actively writing to (mtime within window)
+                now = time.time()
+                active_ids = set()
+                for p in glob.glob(os.path.join(cfg["root"], "*", "*.jsonl")):
+                    try:
+                        if now - os.path.getmtime(p) <= ACTIVE_WINDOW_S:
+                            active_ids.add(os.path.splitext(os.path.basename(p))[0])
+                    except OSError:
+                        continue
+                refused = [i for i in ids if i in active_ids]
+                deletable = [i for i in ids if i not in active_ids]
+                deleted, not_found = delete_sessions(cfg["root"], deletable) if deletable else ([], [])
+                payload = _api_payload(cfg["root"], cfg["include_all"], cfg["assets_dir"])
+                payload["deleted"] = [name for name, _ in deleted]
+                payload["notFound"] = not_found
+                payload["refused"] = refused
+                self._json(payload)
+                return
+            if path == "/api/reveal":
+                ok = _reveal_in_file_manager(body.get("cwd"))
+                self._json({"ok": ok} if ok else {"error": "could not open folder"}, 200 if ok else 400)
+                return
+        except Exception as e:
+            self._json({"error": str(e)}, 500)
+            return
+        self._json({"error": "unknown endpoint"}, 404)
+
+    def _serve_asset(self, assets_dir, path):
+        rel = urllib.parse.unquote(path[len("/" + ASSETS_DIRNAME + "/"):])
+        base = os.path.realpath(assets_dir)
+        target = os.path.realpath(os.path.join(base, rel))
+        if not (target == base or target.startswith(base + os.sep)) or not os.path.isfile(target):
+            self._send(404, b"not found", "text/plain")
+            return
+        ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+        try:
+            with open(target, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            self._send(404, b"not found", "text/plain")
+            return
+        self._send(200, data, ctype)
+
+
+class _Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def serve(root, include_all=False, port=0, open_browser=True):
+    """Run the live dashboard on localhost until interrupted."""
+    assets_dir = os.path.join(os.path.dirname(os.path.abspath(root)), ASSETS_DIRNAME)
+    try:
+        os.makedirs(assets_dir, exist_ok=True)
+    except OSError:
+        pass
+
+    # The shell HTML is data-less; the client fetches /api/sessions on load and on Refresh.
+    html_shell = build_html([], "", note="", api_mode=True, include_all=include_all).encode("utf-8")
+
+    candidates = [port] if port else [7842, 7843, 7860, 8420, 0]
+    httpd = None
+    for p in candidates:
+        try:
+            httpd = _Server(("127.0.0.1", p), _Handler)
+            break
+        except OSError:
+            httpd = None
+    if httpd is None:
+        print("error: could not bind a local port (try --port N)", file=sys.stderr)
+        return 2
+
+    httpd.cfg = {
+        "root": root,
+        "include_all": include_all,
+        "assets_dir": assets_dir,
+        "html": html_shell,
+    }
+    actual_port = httpd.server_address[1]
+    url = f"http://127.0.0.1:{actual_port}/"
+
+    try:
+        sessions, hidden = collect(root, include_all=include_all)
+        n = len(sessions)
+    except Exception:
+        n, hidden = 0, 0
+
+    print("claude-sessions — live dashboard")
+    print(f"  serving   {url}")
+    print(f"  scanning  {root}")
+    print(f"  {n} session(s)" + (f"  ·  {hidden} SDK/agent hidden (toggle in the UI)" if hidden else ""))
+    print("  Refresh / Rename / Delete are one-click.  Press Ctrl+C to stop.")
+    sys.stdout.flush()  # show the URL immediately even when stdout is piped/redirected
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  stopped.")
+    finally:
+        httpd.server_close()
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Live dashboard of all your Claude Code sessions.")
+    ap.add_argument("--root", default=DEFAULT_ROOT, help="Path to ~/.claude/projects")
+    ap.add_argument("--all", action="store_true",
+                    help="Include programmatic (sdk-cli / agent-spawned) sessions, not just ones you started")
+    ap.add_argument("--port", type=int, default=0, help="(server mode) Preferred localhost port; auto-falls back")
+    ap.add_argument("--no-open", dest="open", action="store_false",
+                    help="Do not open the browser automatically")
+    ap.add_argument("--static", action="store_true",
+                    help="Write a self-contained, portable static HTML file instead of serving live")
+    ap.add_argument("--out", default=None, help="(static mode) Output HTML path (default: ~/.claude/claude-sessions.html)")
+    ap.add_argument("--json", action="store_true", help="Print the raw session metadata as JSON and exit")
+    ap.add_argument("--delete", nargs="+", metavar="ID_OR_NAME",
+                    help="Delete one or more sessions by id, custom title, or resume name")
+    ap.add_argument("--rename", nargs=2, metavar=("ID_OR_NAME", "NEW_NAME"),
+                    help="Rename a session by id, current custom title, or resume name")
+    ap.set_defaults(open=True)
+    args = ap.parse_args(argv)
+
+    root = os.path.expanduser(args.root)
+    if not os.path.isdir(root):
+        print(f"error: projects dir not found: {root}", file=sys.stderr)
+        return 2
+
+    if args.delete:
+        deleted, not_found = delete_sessions(root, args.delete)
+        for name, path in deleted:
+            print(f"deleted: {name}  ({path})")
+        if not_found:
+            print(f"error: could not find/delete: {', '.join(not_found)}", file=sys.stderr)
+        return 2 if not_found and not deleted else 0
+
+    if args.rename:
+        token, new_name = args.rename
+        s = rename_session(root, token, new_name)
+        if s is None:
+            print(f"error: could not rename session: {token}", file=sys.stderr)
+            return 2
+        print(f"renamed: {s['id']} -> {new_name}")
+        return 0
+
+    if args.json:
+        sessions, _ = collect(root, include_all=args.all)
+        _strip_image_data(sessions)
+        print(json.dumps(sessions, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.static:
+        sessions, hidden = collect(root, include_all=args.all)
+        generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+        default_out = os.path.join(os.path.dirname(os.path.abspath(root)), "claude-sessions.html")
+        out_path = os.path.expanduser(args.out or default_out)
+        assets_dir = os.path.join(os.path.dirname(os.path.abspath(out_path)), ASSETS_DIRNAME)
+        n_imgs, n_bytes = externalize_images(sessions, assets_dir)
+        note = f"{hidden} SDK/agent sessions hidden (use --all)" if hidden else ""
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(build_html(sessions, generated_at, note, api_mode=False, include_all=args.all))
+        named = sum(1 for s in sessions if s["hasName"])
+        print(f"Wrote {out_path}")
+        print(f"  {len(sessions)} sessions  ({named} named, {len(sessions) - named} unnamed)"
+              + (f"  ·  {hidden} SDK/agent hidden (use --all)" if hidden else ""))
+        if n_imgs:
+            print(f"  {n_imgs} pasted images extracted to {assets_dir} ({n_bytes / 1024 / 1024:.1f} MB)")
+        if args.open:
+            webbrowser.open(pathlib.Path(out_path).resolve().as_uri())
+            print("  opened in browser")
+        else:
+            print(f"  open it with:  open {shlex.quote(out_path)}")
+        return 0
+
+    # default: live server
+    return serve(root, include_all=args.all, port=args.port, open_browser=args.open)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
