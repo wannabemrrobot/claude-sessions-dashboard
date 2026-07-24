@@ -1,0 +1,10 @@
+# Generated dashboard output and local session data — never commit these.
+claude-sessions.html
+claude-sessions-assets/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
