@@ -47,7 +47,7 @@ Claude Code stores each session as a `.jsonl` file under `~/.claude/projects/…
 
 **Read**
 - 📝 **Prompts** — every prompt you sent, including pasted images, collapsible with copy-per-prompt
-- 💬 **Full conversation transcript** — your prompts + Claude's replies **rendered as Markdown** (headings, lists, code blocks, links), with tool calls & results as collapsible rows, and the **model labelled per turn** (only when it changes)
+- 💬 **Full conversation transcript** — your prompts + Claude's replies **rendered as Markdown** (headings, lists, code blocks, links) and any **pasted images**, with tool calls & results as collapsible rows, and the **model labelled per turn** (only when it changes)
 - 🔦 **Search inside a conversation** — `⌘/Ctrl-F` to highlight matches with `n/total` count and up/down navigation
 - ↕️ **Oldest ↔ Newest** order toggle in both viewers
 - 📊 **Stats strip** — models × turn counts · input/output/cache tokens · web-search/fetch counts · Claude Code version · optional **cost estimate**
