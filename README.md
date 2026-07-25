@@ -11,6 +11,8 @@ No more digging through `~/.claude/projects` or guessing session names — one c
   <img alt="Claude Code Sessions dashboard" src="docs/screenshot-light.png">
 </picture>
 
+**▶ Try it in 10 seconds — no setup, no real data:**  `claude-sessions --demo`
+
 </div>
 
 ## Why
@@ -23,6 +25,7 @@ Claude Code stores each session as a `.jsonl` file under `~/.claude/projects/…
 - 🔎 **Search** across names, prompts, project paths, branches, and session ids
 - 🗂️ **Filter & sort** — by project, and by last activity / oldest / duration / most prompts / named / project
 - ☑️ **Named-only** and **Include SDK/agent** toggles (the latter reveals programmatic/subagent sessions, hidden by default)
+- 🎬 **Demo mode** — `--demo` fills the UI with fictional sessions to explore or screenshot; never reads your real data
 
 **Live status**
 - 🟢 **Running indicator** — a pulsing dot on sessions an agent is *actively* writing to right now (polled every few seconds)
@@ -90,6 +93,7 @@ cd claude-sessions-dashboard && chmod +x claude-sessions
 
 ```bash
 claude-sessions                 # launch the live dashboard (opens your browser)
+claude-sessions --demo          # explore a UI full of fictional sessions (never reads your real data)
 claude-sessions --all           # also include SDK/agent-spawned sessions
 claude-sessions --port 7842     # choose a preferred port
 claude-sessions --root PATH     # use a non-standard projects dir
