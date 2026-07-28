@@ -486,7 +486,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --accent-soft:rgba(201,100,66,.10); --accent-soft-2:rgba(201,100,66,.16); --accent-line:rgba(201,100,66,.30);
     --ok:#5E7A52; --ok-soft:rgba(94,122,82,.13);
     --warn:#9A6B1E; --warn-soft:rgba(154,107,30,.13);
-    --danger:#B23A2C; --danger-ink:#9E3323; --danger-soft:rgba(178,58,44,.10);
+    --danger:#B23A2C; --danger-ink:#9E3323; --danger-soft:rgba(178,58,44,.10); --danger-solid:#BE3A28;
     --shadow-1:0 1px 2px rgba(43,38,30,.05), 0 2px 8px rgba(43,38,30,.05);
     --shadow-2:0 14px 34px -14px rgba(43,38,30,.30), 0 2px 8px rgba(43,38,30,.06);
     --shadow-pop:0 30px 70px -22px rgba(43,38,30,.42);
@@ -505,7 +505,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --accent-soft:rgba(224,136,95,.13); --accent-soft-2:rgba(224,136,95,.20); --accent-line:rgba(224,136,95,.34);
       --ok:#8FB37A; --ok-soft:rgba(143,179,122,.14);
       --warn:#E0A54B; --warn-soft:rgba(224,165,75,.14);
-      --danger:#E5776A; --danger-ink:#EF8C80; --danger-soft:rgba(229,119,106,.14);
+      --danger:#E5776A; --danger-ink:#EF8C80; --danger-soft:rgba(229,119,106,.14); --danger-solid:#D53E2E;
       --shadow-1:0 1px 2px rgba(0,0,0,.28), 0 2px 8px rgba(0,0,0,.3);
       --shadow-2:0 16px 38px -14px rgba(0,0,0,.62), 0 2px 8px rgba(0,0,0,.42);
       --shadow-pop:0 34px 74px -22px rgba(0,0,0,.76);
@@ -521,7 +521,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --accent-soft:rgba(224,136,95,.13); --accent-soft-2:rgba(224,136,95,.20); --accent-line:rgba(224,136,95,.34);
     --ok:#8FB37A; --ok-soft:rgba(143,179,122,.14);
     --warn:#E0A54B; --warn-soft:rgba(224,165,75,.14);
-    --danger:#E5776A; --danger-ink:#EF8C80; --danger-soft:rgba(229,119,106,.14);
+    --danger:#E5776A; --danger-ink:#EF8C80; --danger-soft:rgba(229,119,106,.14); --danger-solid:#D53E2E;
     --shadow-1:0 1px 2px rgba(0,0,0,.28), 0 2px 8px rgba(0,0,0,.3);
     --shadow-2:0 16px 38px -14px rgba(0,0,0,.62), 0 2px 8px rgba(0,0,0,.42);
     --shadow-pop:0 34px 74px -22px rgba(0,0,0,.76);
@@ -740,8 +740,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .act svg{ flex-shrink:0; }
   .act.delete:hover, .act.danger{ color:var(--danger-ink); }
   .act.danger:hover{ background:var(--danger-soft); border-color:color-mix(in srgb, var(--danger) 40%, transparent); }
-  .act.solid{ background:var(--danger); color:#fff; border-color:transparent; }
-  .act.solid:hover{ background:var(--danger); filter:brightness(1.06); color:#fff; }
+  .act.solid{ background:var(--danger-solid); color:#fff; border-color:transparent; box-shadow:0 4px 12px -6px var(--danger-solid); }
+  .act.solid:hover{ background:var(--danger-solid); filter:brightness(1.07); color:#fff; }
+  .act.solid svg{ color:#fff; }
   .act-spacer{ flex:1; }
   .confirm-txt{ color:var(--danger-ink); font-size:11.5px; font-weight:600; display:inline-flex; align-items:center; gap:6px; }
   .confirm-txt svg{ color:var(--danger-ink); }
@@ -773,6 +774,67 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .loading{ display:flex; flex-direction:column; align-items:center; gap:14px; padding:100px 20px; color:var(--muted); }
   .spinner{ width:34px; height:34px; border-radius:50%; border:3px solid var(--border-2); border-top-color:var(--accent);
     animation:spin .8s linear infinite; }
+  .spinner.md{ width:26px; height:26px; }
+  /* inline spinner for buttons — inherits the button's text colour so it reads on any bg */
+  .btn-spin{ width:13px; height:13px; border-radius:50%; display:inline-block; flex-shrink:0;
+    border:2px solid color-mix(in srgb, currentColor 30%, transparent); border-top-color:currentColor;
+    animation:spin .7s linear infinite; }
+
+  /* ---------- per-card busy overlay (delete in flight) ---------- */
+  @keyframes fadeIn{ from{ opacity:0; } to{ opacity:1; } }
+  .card.busy{ pointer-events:none; }
+  .busy-ov{ position:absolute; inset:0; z-index:8; display:grid; place-items:center; border-radius:inherit;
+    background:color-mix(in srgb, var(--card) 60%, transparent); backdrop-filter:blur(1.5px); -webkit-backdrop-filter:blur(1.5px);
+    animation:fadeIn .12s var(--ease); }
+
+  /* ---------- multi-select ---------- */
+  .ctrl-btn.active{ background:var(--accent-soft-2); border-color:var(--accent); color:var(--accent-ink); }
+  .ctrl-btn.active .ic svg{ color:var(--accent-ink); }
+  /* per-card checkbox — hidden until select mode is on */
+  .selbox{ position:absolute; top:13px; left:13px; z-index:5; width:21px; height:21px; border-radius:7px;
+    display:none; place-items:center; cursor:pointer; padding:0; color:transparent;
+    background:var(--card); border:1.5px solid var(--border-2); box-shadow:var(--shadow-1);
+    transition:background .14s var(--ease), border-color .14s var(--ease), color .14s var(--ease), transform .1s var(--ease); }
+  .selbox svg{ width:13px; height:13px; }
+  body.selecting .selbox{ display:grid; }
+  body.selecting .card .row1{ padding-left:29px; }
+  body.selecting .card{ cursor:pointer; }
+  /* in select mode the whole card is the toggle; its own controls step aside */
+  body.selecting .card .btnrow,
+  body.selecting .card .cmdrow,
+  body.selecting .card .actions{ opacity:.45; pointer-events:none; }
+  .card.selected{ border-color:var(--accent); box-shadow:0 0 0 2px var(--accent), var(--shadow-1); }
+  .card.selected:hover{ box-shadow:0 0 0 2px var(--accent), var(--shadow-2); }
+  .card.selected .selbox{ background:var(--accent); border-color:var(--accent); color:var(--on-accent); }
+  .selbox:disabled{ opacity:.4; cursor:not-allowed; }
+
+  /* floating bulk-action bar */
+  .selbar{ position:fixed; left:50%; bottom:24px; transform:translateX(-50%); z-index:70;
+    display:flex; align-items:center; gap:10px; max-width:calc(100vw - 28px); flex-wrap:wrap; justify-content:center;
+    background:var(--card); border:1px solid var(--border-2); border-radius:14px; padding:9px 13px;
+    box-shadow:var(--shadow-pop); animation:selbarIn .22s var(--ease); }
+  @keyframes selbarIn{ from{ opacity:0; transform:translateX(-50%) translateY(16px); } to{ opacity:1; transform:translateX(-50%) translateY(0); } }
+  .selbar-count{ font-size:12.5px; color:var(--muted); white-space:nowrap; }
+  .selbar-count b{ color:var(--text); font-weight:700; font-size:14px; }
+  .selbar-sep{ width:1px; height:20px; background:var(--border-2); flex-shrink:0; }
+  .selbar-link{ background:transparent; border:1px solid transparent; color:var(--accent-ink); font-family:inherit;
+    font-size:12px; font-weight:600; cursor:pointer; border-radius:8px; padding:6px 9px; white-space:nowrap;
+    transition:background .13s var(--ease), color .13s var(--ease); }
+  .selbar-link:hover{ background:var(--accent-soft); }
+  .selbar-link:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .selbar-link.ghost{ color:var(--muted); }
+  .selbar-link.ghost:hover{ background:var(--inset); color:var(--text); }
+  .selbar-actions{ display:flex; align-items:center; gap:8px; }
+  .selbar-confirm{ display:inline-flex; align-items:center; gap:6px; color:var(--danger-ink); font-size:12px; font-weight:600; white-space:nowrap; }
+  .selbar-confirm svg{ color:var(--danger-ink); }
+  .selbar-del{ display:inline-flex; align-items:center; gap:6px; cursor:pointer; font-family:inherit; white-space:nowrap;
+    background:var(--danger-solid); color:#fff; border:none; border-radius:9px; padding:8px 13px; font-size:12px; font-weight:700;
+    box-shadow:0 6px 15px -7px var(--danger-solid); transition:filter .15s var(--ease), transform .1s var(--ease); }
+  .selbar-del svg{ color:#fff; }
+  .selbar-del:hover{ filter:brightness(1.07); }
+  .selbar-del:active{ transform:scale(.96); }
+  .selbar-del:focus-visible{ outline:2px solid var(--danger-solid); outline-offset:2px; }
+  .selbar-del:disabled{ opacity:.45; cursor:default; filter:none; box-shadow:none; }
 
   /* ---------- prompt modal ---------- */
   .overlay{ position:fixed; inset:0; z-index:80; display:flex; align-items:center; justify-content:center; padding:24px;
@@ -911,6 +973,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div class="spacer"></div>
     <div class="stats" id="stats"></div>
+    <button type="button" id="selectToggle" class="ctrl-btn" data-tip="Select multiple sessions to delete at once" hidden>
+      <span class="ic" id="selectIcon"></span><span class="lbl">Select</span>
+    </button>
     <button type="button" id="refreshBtn" class="ctrl-btn primary" data-tip="Reload sessions from disk">
       <span class="ic" id="refreshIcon"></span><span class="lbl">Refresh</span>
     </button>
@@ -948,6 +1013,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" hidden>__ICON_SEARCH_BIG__<div>No sessions match your filter.</div></div>
 </main>
+<div class="selbar" id="selbar" role="region" aria-label="Bulk selection actions" hidden>
+  <span class="selbar-count"><b id="selCount">0</b> selected</span>
+  <span class="selbar-sep"></span>
+  <button class="selbar-link" id="selAll" type="button">Select all</button>
+  <button class="selbar-link" id="selClear" type="button">Clear</button>
+  <span class="selbar-sep"></span>
+  <div class="selbar-actions" id="selActions"></div>
+</div>
 <div id="toast"></div>
 <div id="tooltip" role="tooltip" aria-hidden="true"></div>
 
@@ -1062,6 +1135,10 @@ let SESSIONS = [];
 let hiddenCount = 0;
 let firstRender = true;
 let ACTIVE = new Set();   // ids of sessions an agent is actively writing to (from /api/active)
+let SELECT_MODE = false;      // multi-select mode: card clicks toggle selection instead of copying
+let SELECTED = new Set();     // ids of sessions ticked for bulk delete
+let SELBAR_CONFIRM = false;   // bulk-delete bar is showing its "permanently?" confirm state
+let DELETING = false;         // a delete request is in flight — suppress the live-poll re-render
 const $ = s => document.querySelector(s);
 
 let BOOT = null;
@@ -1090,6 +1167,7 @@ const IC={
   image: SVG('<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',15),
   edit: SVG('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>',13),
   trash: SVG('<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',13),
+  checkSquare: SVG('<path d="m9 11 3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',15),
   resume: SVG('<polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/>',14),
   convo: SVG('<path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4c0-1.1.9-2 2-2h8a2 2 0 0 1 2 2Z"/><path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/>',14),
   tool: SVG('<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',12),
@@ -1234,15 +1312,103 @@ async function doRename(s,name){
   try{ const j=await apiPost('/api/rename',{id:s.id,name}); applyData(j); showToast(IC.check,'Renamed session','ok'); }
   catch(e){ showToast(IC.warn,'Rename failed: '+e.message,'warn'); }
 }
-async function doDelete(s){
+/* Dim a card and float a spinner over it while its delete request is in flight, so a
+   slow disk re-scan reads as "working…" instead of a frozen UI. */
+function setCardBusy(card,on){
+  if(!card) return;
+  let ov=card.querySelector(':scope > .busy-ov');
+  if(on){
+    card.classList.add('busy');
+    if(!ov){ ov=document.createElement('div'); ov.className='busy-ov'; ov.innerHTML='<div class="spinner md"></div>'; card.appendChild(ov); }
+  }else{
+    card.classList.remove('busy');
+    if(ov) ov.remove();
+  }
+}
+function cardById(id){ return $('#grid .card[data-id="'+id+'"]'); }
+
+async function doDelete(s,card){
   if(!API_MODE) return;
+  DELETING=true;
+  setCardBusy(card,true);
   try{
     const j=await apiPost('/api/delete',{ids:[s.id]});
+    DELETING=false;
     if(j.refused && j.refused.length) showToast(IC.warn,"Can't delete a running session",'warn');
     else showToast(IC.check,'Session deleted','ok');
     applyData(j);
   }
-  catch(e){ showToast(IC.warn,'Delete failed: '+e.message,'warn'); }
+  catch(e){ DELETING=false; setCardBusy(card,false); showToast(IC.warn,'Delete failed: '+e.message,'warn'); }
+}
+
+/* ---- multi-select + bulk delete ---- */
+function setSelectMode(on){
+  if(!API_MODE) return;
+  SELECT_MODE=on; SELBAR_CONFIRM=false;
+  if(!on) SELECTED.clear();
+  document.body.classList.toggle('selecting', on);
+  const b=$('#selectToggle');
+  if(b){ b.classList.toggle('active', on); const l=b.querySelector('.lbl'); if(l) l.textContent = on?'Done':'Select'; }
+  $('#selbar').hidden=!on;
+  applySelectionClasses();
+  renderSelBar();
+}
+function toggleSelect(s,card){
+  if(ACTIVE.has(s.id)){ showToast(IC.warn,"A running session can't be deleted",'warn'); return; }
+  if(SELECTED.has(s.id)){ SELECTED.delete(s.id); card.classList.remove('selected'); }
+  else{ SELECTED.add(s.id); card.classList.add('selected'); }
+  SELBAR_CONFIRM=false;
+  renderSelBar();
+}
+function applySelectionClasses(){
+  document.querySelectorAll('#grid .card').forEach(c=>c.classList.toggle('selected', SELECTED.has(c.dataset.id)));
+}
+function selectAllVisible(){
+  document.querySelectorAll('#grid .card').forEach(c=>{ if(!ACTIVE.has(c.dataset.id)) SELECTED.add(c.dataset.id); });
+  SELBAR_CONFIRM=false; applySelectionClasses(); renderSelBar();
+}
+function clearSelection(){ SELECTED.clear(); SELBAR_CONFIRM=false; applySelectionClasses(); renderSelBar(); }
+function renderSelBar(){
+  const n=SELECTED.size, cEl=$('#selCount'); if(cEl) cEl.textContent=n;
+  const acts=$('#selActions'); if(!acts) return;
+  if(SELBAR_CONFIRM && n>0){
+    acts.innerHTML=`<span class="selbar-confirm">${IC.warn}Delete <b>${n}</b> permanently?</span>`+
+      `<button class="selbar-link" id="selCancelDel" type="button">Cancel</button>`+
+      `<button class="selbar-del" id="selConfirmDel" type="button">${IC.trash}Delete ${n}</button>`;
+    $('#selCancelDel').onclick=()=>{ SELBAR_CONFIRM=false; renderSelBar(); };
+    $('#selConfirmDel').onclick=()=>doBulkDelete();
+  }else{
+    SELBAR_CONFIRM=false;
+    acts.innerHTML=`<button class="selbar-link ghost" id="selDone" type="button">Done</button>`+
+      `<button class="selbar-del" id="selDelete" type="button"${n?'':' disabled'}>${IC.trash}Delete${n?' '+n:''}</button>`;
+    $('#selDone').onclick=()=>setSelectMode(false);
+    $('#selDelete').onclick=()=>{ if(!SELECTED.size) return; SELBAR_CONFIRM=true; renderSelBar(); };
+  }
+}
+async function doBulkDelete(){
+  const ids=[...SELECTED];
+  if(!ids.length) return;
+  DELETING=true;
+  const btn=$('#selConfirmDel');
+  if(btn){ btn.disabled=true; btn.innerHTML=`<span class="btn-spin"></span>Deleting ${ids.length}…`; const c=$('#selCancelDel'); if(c) c.disabled=true; }
+  ids.forEach(id=>setCardBusy(cardById(id),true));
+  try{
+    const j=await apiPost('/api/delete',{ids});
+    const delCount=(j.deleted||[]).length, refused=(j.refused||[]).length;
+    DELETING=false;
+    SELECT_MODE=false; SELECTED.clear(); SELBAR_CONFIRM=false;
+    document.body.classList.remove('selecting');
+    const tb=$('#selectToggle'); if(tb){ tb.classList.remove('active'); const l=tb.querySelector('.lbl'); if(l) l.textContent='Select'; }
+    $('#selbar').hidden=true;
+    applyData(j);
+    if(refused) showToast(IC.warn,`Deleted ${delCount} · skipped ${refused} running`,'warn');
+    else showToast(IC.check,`Deleted ${delCount} session${delCount===1?'':'s'}`,'ok');
+  }catch(e){
+    DELETING=false;
+    ids.forEach(id=>setCardBusy(cardById(id),false));
+    showToast(IC.warn,'Delete failed: '+e.message,'warn');
+    SELBAR_CONFIRM=false; renderSelBar();
+  }
 }
 async function doReveal(s){
   if(!API_MODE) return;
@@ -1259,7 +1425,7 @@ function applyActive(){
   });
 }
 async function pollActive(){
-  if(!API_MODE) return;
+  if(!API_MODE || DELETING) return;   // don't re-render mid-delete: it would wipe the busy overlay
   try{
     const j=await apiGet('/api/active');
     const next=new Set(j.active||[]);
@@ -1531,7 +1697,7 @@ function armDelete(card,s){
     `<button class="act cancel" type="button">Cancel</button>`+
     `<button class="act solid confirm" type="button">${IC.trash}Delete</button>`;
   bar.querySelector('.cancel').addEventListener('click', e=>{ e.stopPropagation(); render(); });
-  bar.querySelector('.confirm').addEventListener('click', e=>{ e.stopPropagation(); doDelete(s); });
+  bar.querySelector('.confirm').addEventListener('click', e=>{ e.stopPropagation(); doDelete(s,card); });
 }
 
 /* ---- render ---- */
@@ -1555,7 +1721,7 @@ function buildCard(s,i){
   const rel=relTime(s.lastTs);
   const ageCls = rel.days==null ? "" : (rel.days<=3 ? "fresh" : (rel.days>=30 ? "old":""));
   const card=document.createElement('div');
-  card.className="card"+(s.customTitle?" named":"")+(ACTIVE.has(s.id)?" live":"")+(firstRender?" enter":"");
+  card.className="card"+(s.customTitle?" named":"")+(ACTIVE.has(s.id)?" live":"")+(SELECTED.has(s.id)?" selected":"")+(firstRender?" enter":"");
   card.dataset.id=s.id;
   card.style.setProperty('--i', Math.min(i,26));
   card.tabIndex=0; card.setAttribute('role','button'); card.setAttribute('aria-label','Resume session '+titleOf(s));
@@ -1585,7 +1751,10 @@ function buildCard(s,i){
       <button class="act delete" type="button"${ACTIVE.has(s.id)?" disabled":""} data-tip="${ACTIVE.has(s.id)?"Can't delete a running session":"Delete this session permanently"}">${IC.trash}Delete</button>
     </div>` : "";
 
-  card.innerHTML=`
+  const selBox = API_MODE
+    ? `<button class="selbox" type="button" tabindex="-1" aria-hidden="true"${ACTIVE.has(s.id)?" disabled":""} data-tip="${ACTIVE.has(s.id)?"Running — can't be deleted":"Select this session"}">${IC.check}</button>`
+    : "";
+  card.innerHTML=`${selBox}
     <div class="row1"><div class="title">${esc(titleOf(s))}</div><div class="badges">${badges.join("")}</div></div>
     <div class="pathline">
       <span class="p" data-tip="${esc(s.cwd)}">${IC.folder}<span class="ptxt">${esc(s.cwdShort||s.cwd)}</span></span>
@@ -1605,8 +1774,8 @@ function buildCard(s,i){
     </div>
     ${actionsRow}`;
 
-  card.addEventListener('click', ()=>copyText(s.resumeCmd,"Copied resume command"));
-  card.addEventListener('keydown', e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); copyText(s.resumeCmd,"Copied resume command"); }});
+  card.addEventListener('click', ()=>{ if(SELECT_MODE){ toggleSelect(s,card); return; } copyText(s.resumeCmd,"Copied resume command"); });
+  card.addEventListener('keydown', e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); if(SELECT_MODE){ toggleSelect(s,card); return; } copyText(s.resumeCmd,"Copied resume command"); }});
   card.querySelector('.cmd').addEventListener('click', e=>{ e.stopPropagation(); copyText(s.resumeCmd,"Copied resume command"); });
   card.querySelector('.resume').addEventListener('click', e=>{ e.stopPropagation(); copyText(s.resumeCmd,"Copied resume command"); });
   const pb=card.querySelector('.prompts-btn');
@@ -1657,6 +1826,13 @@ function render(){
     `<span class="stat"><b>${rows.length}</b><span>of ${SESSIONS.length} shown</span></span>`+
     `<span class="stat"><b>${SESSIONS.filter(s=>s.hasName).length}</b><span>named</span></span>`+
     `<span class="stat"><b>${projCount}</b><span>projects</span></span>`;
+
+  if(SELECT_MODE){
+    // a selected session may have vanished from disk between renders — drop stale ids
+    const live=new Set(SESSIONS.map(s=>s.id));
+    SELECTED.forEach(id=>{ if(!live.has(id)) SELECTED.delete(id); });
+    renderSelBar();
+  }
   firstRender=false;
 }
 
@@ -1669,6 +1845,12 @@ $('#refreshBtn').addEventListener('click',()=>loadSessions(true));
 if(API_MODE){
   const w=$('#allWrap'); if(w) w.hidden=false;
   const cb=$('#showall'); if(cb){ cb.checked=INCLUDE_ALL; cb.addEventListener('change',()=>{ INCLUDE_ALL=cb.checked; loadSessions(true); }); }
+  const st=$('#selectToggle');
+  if(st){ st.hidden=false; $('#selectIcon').innerHTML=IC.checkSquare; st.addEventListener('click',()=>setSelectMode(!SELECT_MODE)); }
+  $('#selAll').addEventListener('click', selectAllVisible);
+  $('#selClear').addEventListener('click', clearSelection);
+  renderSelBar();   // seed the bar's action cluster (Done / Delete)
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape' && SELECT_MODE && overlay.hidden){ e.preventDefault(); setSelectMode(false); } });
 }
 overlay.addEventListener('click', e=>{ if(e.target===overlay) closeModal(); });
 $('#modalClose').addEventListener('click', closeModal);
