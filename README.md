@@ -6,10 +6,7 @@
 
 No more digging through `~/.claude/projects` or guessing session names — one click to refresh, rename, delete, open, or copy a resume command.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-  <img alt="Claude Code Sessions dashboard" src="docs/screenshot-light.png">
-</picture>
+<img alt="Claude Code Sessions — browsing sessions, the conversation view with declutter, and the artifacts view" src="docs/demo.gif" width="900">
 
 **▶ Try it in 10 seconds — no setup, no real data:**  `claude-sessions --demo`
 
@@ -20,6 +17,10 @@ No more digging through `~/.claude/projects` or guessing session names — one c
 Claude Code stores each session as a `.jsonl` file under `~/.claude/projects/…`. Over time you accumulate hundreds, and resuming the right one means remembering exact names and directories (`claude --resume "name"` fails with *"no session named X"* if you're in the wrong folder). This turns that pile into a fast, searchable dashboard — served locally, in your browser.
 
 ## Features
+
+<div align="center">
+  <img alt="The dashboard: session cards with model, tokens, active time, and per-session artifacts" src="docs/screenshot-dark.png" width="900">
+</div>
 
 **Find**
 - 🔎 **Search** across names, prompts, project paths, branches, and session ids
@@ -74,7 +75,7 @@ Claude Code stores each session as a `.jsonl` file under `~/.claude/projects/…
 - Binds to `127.0.0.1` only, rejects non-loopback hosts, and requires JSON `POST` bodies (so a random web page can't reach it)
 
 <div align="center">
-  <img alt="Full conversation transcript with Markdown, model labels, search and stats" src="docs/conversation.png" width="820">
+  <img alt="Conversation transcript with declutter on — you in green, Claude in terracotta, tool steps hidden" src="docs/conversation.png" width="820">
 </div>
 
 ## Requirements
