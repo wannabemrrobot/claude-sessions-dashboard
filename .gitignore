@@ -2,6 +2,9 @@
 claude-sessions.html
 claude-sessions-assets/
 
+# Local Claude Code / editor config (dev-server ports etc.) — machine-specific.
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]
