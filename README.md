@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/mascot.gif" alt="" width="112">
+
 # Claude Code Sessions
 
 **A live, local dashboard to browse, search, resume, and manage every [Claude Code](https://claude.com/claude-code) session on your machine.**
